@@ -1,0 +1,86 @@
+---
+name: releashed-explore
+description: Explore a deployed web product you know nothing about and turn what you see into a map of its user flows. Use when the user asks you to map, explore, or walk through a product's screens and journeys from its URL, or points at the releashed explore MCP server. Needs the `releashed-explore` MCP server (observe, act, record, finish).
+---
+
+# Map a product by looking at it
+
+You are the eyes. The `releashed-explore` MCP server is the hands and the notebook: it drives a real
+browser behind a request boundary, and it keeps the evidence that becomes the map. Nothing you
+believe about the product counts; only what a screenshot showed and the server recorded.
+
+## Run this in a subagent
+
+Sixty screenshots do not belong in the user's main thread. Launch a subagent scoped to the
+`releashed-explore` server and let it run the whole loop, then report back the map path and a
+paragraph about what the product does. If you are already that subagent, just run the loop.
+
+## The loop
+
+1. **`observe`** — look at the screen. You get a screenshot, the current address, and how many steps
+   are left.
+2. **Decide, in plain English.** One action a curious new user would try next, plus a short noun
+   phrase naming what to point at, the way you would tell a person on the phone: "the blue Sign up
+   button, top right", "the search box in the middle". Never a CSS selector, an XPath or an element
+   id — the server points by looking at the picture, exactly as you do.
+3. **`act`** — hand over that instruction. It answers whether the screen changed and where you now
+   are.
+4. **`record`** — keep the transition. **An act you do not record never happened**: it is not in the
+   map, and the map is the only deliverable. Record every act whose result you believe.
+5. Repeat until the step budget runs out or you genuinely have nothing new to try, then **`finish`**,
+   which packages the evidence and renders `map.html`. Give it one sentence saying why you stopped.
+
+## Keep your own history compact, in text
+
+You will run out of context long before you run out of steps if you lean on the screenshots. After
+each step write yourself one short line — `12: tapped "Dashboards" -> dashboards list, new page` —
+and reason from that list. Do not re-read old screenshots; if you are unsure what is on screen, call
+`observe` again. The current screen is the only picture you need.
+
+## What to explore
+
+Map the whole product, not one task. When the thing you were doing is finished, blocked, or just
+repeating itself, go and find a **different kind of** part of the product — look at whatever
+navigation the screen offers.
+
+Prefer screens you can *do* something on — sign up, create, configure, search, book, buy — over
+screens that only describe the product: documentation, blog posts, changelogs, help articles, legal
+pages. Reading material tells you what the product claims; only an interactive screen tells you what
+it does.
+
+**Carry one of each kind of task all the way to its end before you move on.** A product's most
+telling screens are the ones that only appear when something is finished: the result, the score, the
+confirmation, the receipt, the "what next" it offers you afterwards. Opening a quiz and closing it
+after two questions maps the door and never the room. So the first time you meet a kind of task,
+complete it — answer every question, submit the form, reach whatever the product shows at the end —
+and only then go looking for a different kind of task. Later examples of that same kind you may
+sample and leave.
+
+Prefer an address you have not visited over one that only redraws the address you are on. Opening a
+tab or toggling a switch can change the picture completely and still be the same page. When an area
+stops producing new addresses, backtrack to something you left untried elsewhere rather than
+concluding the product is exhausted.
+
+## The honesty rules — these are not negotiable
+
+- **Never evade a bot check, a paywall or a login wall.** A wall is a finding. Record how you got
+  there, say so in your report, and go somewhere else. Do not look for a back door, a different user
+  agent, an API, or a "test" route.
+- **Never log in, and never sign up.** The server refuses to type an email address, a phone number
+  or a password into a product it does not own, and it is right to. If the user wants their logged-in
+  flows mapped, they log in themselves with `releashed map <url> --login`, in their own browser.
+- **Never invent a value to get past a form.** A made-up email address is both a lie in the evidence
+  and a push against a door we promised not to push.
+- **Read-only.** The boundary refuses every mutating request to the product's own origin, so a
+  purchase, a booking or a deletion cannot go through. Do not try to work around a refusal — report
+  it as the wall it is.
+- **Say what you saw, not what you assume.** If you did not see a screen, it is not in the map, and
+  your summary may not claim it exists.
+- Off-site links are not followed. The server puts the browser back where it was and tells you so;
+  take that as a closed door and try something else.
+
+## When you finish
+
+Report three things to the user: the path of `map.html`, how many transitions were recorded, and a
+short plain-English description of what the product does and which parts you could not reach and
+why. Then tell them they can serve the finished map to any agent with `releashed mcp <candidate-dir>`.

@@ -1,0 +1,67 @@
+{
+  "name": "releashed",
+  "version": "0.1.0",
+  "description": "Map a deployed product's user flows from its URL alone: screenshots in, an evidence-backed map out.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "releashed": "bin/releashed.mjs"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "scripts/vision-explorer-run.mjs",
+    "scripts/vision-explorer-spike.mjs",
+    "scripts/map-mcp.mjs",
+    "scripts/capture-session.mjs",
+    "scripts/author-target-pack.mjs",
+    "scripts/caption-screens.mjs",
+    "scripts/package-candidate.mjs",
+    "scripts/prepare-bounded-onboarding-run.mjs",
+    "scripts/retire-completed-owner-bundle.mjs",
+    "scripts/explorer-ruler.mjs",
+    "scripts/prepare-target-run.mjs",
+    "scripts/create-owner-bundle.mjs",
+    "scripts/prepare-public-pack-run.mjs",
+    "scripts/run-production-explorer.mjs",
+    "scripts/rebind-public-pack.mjs",
+    "scripts/reconcile-recovery.mjs",
+    "scripts/trusted-control-probe.mjs",
+    "renderer/",
+    "skills/",
+    "supervisor/",
+    "sandbox/",
+    "README.md",
+    "LICENSE",
+    "docs/map-schema.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "capture-session": "node scripts/capture-session.mjs",
+    "calibrate:control": "node scripts/trusted-control-probe.mjs",
+    "reconcile:recovery": "node scripts/reconcile-recovery.mjs",
+    "render": "node renderer/render-map.mjs",
+    "caption-screens": "node scripts/caption-screens.mjs",
+    "package-candidate": "node scripts/package-candidate.mjs",
+    "prepare:bounded-onboarding": "node scripts/prepare-bounded-onboarding-run.mjs",
+    "create:owner-bundle": "node scripts/create-owner-bundle.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "spike:vision": "node scripts/vision-explorer-spike.mjs",
+    "map-mcp": "node scripts/map-mcp.mjs",
+    "releashed": "node bin/releashed.mjs"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "4.0.49",
+    "@ai-sdk/openai-compatible": "3.0.44",
+    "@anthropic-ai/sdk": "^0.123.0",
+    "@midscene/core": "^1.12.3",
+    "@midscene/web": "^1.12.3",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@playwright/test": "^1.62.1",
+    "ai": "7.0.93",
+    "playwright": "^1.62.1"
+  }
+}
