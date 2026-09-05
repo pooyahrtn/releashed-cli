@@ -85,6 +85,6 @@ test("a read-only run refuses to type contact details or a password into somebod
   assert.equal(checkActionAuthorized(typing("+31 6 12345678"), origins, url, true).authorized, false);
   // Ordinary typing on the same read-only target is untouched -- this suppresses credentials, not input.
   assert.equal(checkActionAuthorized(typing("Amsterdam"), origins, url, true).authorized, true);
-  // A target we own (read-only off, the inburgering.coach path) is byte-identical to before.
+  // A target we own (read-only off, the example.com path) is byte-identical to before.
   assert.equal(checkActionAuthorized(typing("testmapper2024@example.com"), origins, url).authorized, true);
 });

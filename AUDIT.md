@@ -229,3 +229,16 @@ base64 strings are ordinary npm package integrity hashes, not secrets.
   facing copy lived; I did not re-derive them from a run record myself, since the lab's other run
   logs (where that derivation would live) are exactly what this exercise keeps private. Worth a
   quick gut-check that they still hold before this goes out.
+
+## Ruled on before publishing (2026-09-06)
+
+- The Clerk-session-shaped test value was replaced with an obviously fake one.
+- The author's own product name was removed from code comments and from the refusal test.
+- The `brandfetch.com` behaviour comment was generalised; no third party is named in the code now.
+- **One deliberate exception:** `lib/public-pack-fetch.mjs` pins its "sole approved public source" to
+  the author's own site, and two tests assert that rule. It is a rail from an early spike, unused by
+  `releashed map`, and the rule is only meaningful to its author. It stays as is rather than being
+  loosened, because weakening a safety rail to tidy a repo is the wrong trade. A later cleanup should
+  delete that pipeline from this package rather than re-point it.
+- The README's cost and grounding numbers come from the author's own recorded runs; the grounding one
+  now says plainly that it was a small probe.

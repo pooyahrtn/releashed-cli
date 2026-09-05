@@ -27,7 +27,7 @@ test("the action boundary refuses a mutating one-way request and allows the rest
 
 test("the retained boundary log masks opaque object ids in request paths", () => {
   assert.equal(
-    maskOpaqueIds("/v1/client/sessions/sess_3IsHSnlLKuG24Rq4bRvXtXI4rR9/tokens"),
+    maskOpaqueIds("/v1/client/sessions/sess_EXAMPLEsessionIDnotarealone/tokens"),
     "/v1/client/sessions/<id>/tokens",
   );
   assert.equal(maskOpaqueIds("/api/onboarding/answer"), "/api/onboarding/answer");

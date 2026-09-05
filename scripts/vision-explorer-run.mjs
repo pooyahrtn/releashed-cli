@@ -59,7 +59,7 @@ import {
 } from "./vision-explorer-spike.mjs";
 
 // Fallback viewport for a target that names no --target-config, or one whose config omits
-// "viewport" -- unchanged, so the original inburgering.coach path keeps this exact phone size.
+// "viewport" -- unchanged, so an existing target keeps this exact phone size.
 const DEFAULT_VIEWPORT = { width: 390, height: 844 };
 
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -177,7 +177,7 @@ export async function resolveTarget(app, targetConfigPath) {
   }
   const allowedOrigins = [...new Set([new URL(app).origin, ...additionalOrigins])];
   // Per-target viewport, defaulting to the original phone size so every existing target (including
-  // inburgering.coach) is unaffected unless it opts in.
+  // an existing target) is unaffected unless it opts in.
   const viewport = config.viewport ?? DEFAULT_VIEWPORT;
   if (
     !Number.isInteger(viewport.width) ||
@@ -290,7 +290,7 @@ export async function loadSavedSession(page, cdp, app, savedSessionPath) {
 // loadSavedSession(), landing on something that looks like a sign-in/reset page is not an error --
 // exploring exactly that logged-out surface (marketing pages, signup steps, sign-in, password
 // reset) is the point of this mode, so there is no isAuthFlowUrl() check here.
-// "networkidle" is not a promise a stranger's site makes. brandfetch.com never goes idle -- an
+// "networkidle" is not a promise a stranger's site makes. some sites never go idle -- an
 // analytics beacon, a chat widget or an autoplaying video keeps a request in flight -- so a hard
 // `waitUntil: "networkidle"` threw `page.goto: Timeout 30000ms exceeded` and ended the run before
 // the first screenshot. Land on domcontentloaded, which every page reaches, then give idle a short
@@ -453,7 +453,7 @@ export function reanchorLastEvent(events, evidence) {
 async function main() {
   const { app, steps: maxSteps, targetConfigPath, minutes, maxEur, runDirRoot } = options(process.argv.slice(2));
   const target = await resolveTarget(app, targetConfigPath);
-  // sk_live is the production instance that owns clerk.inburgering.coach. Both are accepted; which
+  // sk_live is the production instance that owns the app's own Clerk domain. Both are accepted; which
   // one is in the environment is what decides whether the disposable identity is a dev or a real
   // account, and the identity is deleted on every terminal path either way. Only checked in
   // clerk mode -- a saved-session target isn't on Clerk at all and needs no such key.

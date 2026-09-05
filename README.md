@@ -43,7 +43,7 @@ APIs.
 work, plus that Chromium is installed, before you spend anything on a real run.
 
 **Two keys is one too many and we know it.** Anthropic's own model can point at a control accurately
-(measured: 8 of 8 controls, all inside the real element), so the second key goes away when that swap
+(measured on a small probe: 8 of 8 controls, every one inside the real element), so the second key goes away when that swap
 lands. Until then the browser-automation library we use has no Anthropic grounding family, and we
 would rather ask you for a second key than pretend one model is doing both jobs. A 60-step map costs
 roughly EUR 0.50 on Sonnet or EUR 1.00 on Opus, on your key, plus a fraction of a cent for the
