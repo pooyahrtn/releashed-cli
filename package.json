@@ -63,5 +63,14 @@
     "@playwright/test": "^1.62.1",
     "ai": "7.0.93",
     "playwright": "^1.62.1"
+  },
+  "author": "Pooya Haratian",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pooyahrtn/releashed.git"
+  },
+  "homepage": "https://releashed.io",
+  "bugs": {
+    "url": "https://github.com/pooyahrtn/releashed/issues"
   }
 }
