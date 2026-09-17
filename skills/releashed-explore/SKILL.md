@@ -19,14 +19,20 @@ paragraph about what the product does. If you are already that subagent, just ru
 
 1. **`observe`** — look at the screen. You get a screenshot, the current address, and how many steps
    are left.
-2. **Decide, in plain English.** One action a curious new user would try next, plus a short noun
-   phrase naming what to point at, the way you would tell a person on the phone: "the blue Sign up
-   button, top right", "the search box in the middle". Never a CSS selector, an XPath or an element
-   id — the server points by looking at the picture, exactly as you do.
+2. **Decide from the screenshot.** One action a curious new user would try next and a short
+   noun phrase naming it: the server points from your phrase on the bytes you just saw, so omit
+   `coordinate`/`drop_coordinate` -- sending one is refused, never used as a fallback. Never a CSS
+   selector, an XPath or an element id. A scroll says `direction: "up"` or `"down"` (with an
+   optional pane point); each scroll is exactly 600 pixels. A locator miss dispatches nothing --
+   rephrase the target or try a different control. (Only an explicitly legacy server without its
+   own locator wants your pixel coordinate; the installed server refuses to start that way.)
 3. **`act`** — hand over that instruction. It answers whether the screen changed and where you now
    are.
 4. **`record`** — keep the transition. **An act you do not record never happened**: it is not in the
-   map, and the map is the only deliverable. Record every act whose result you believe.
+   map, and the map is the only deliverable. Record every act whose result you believe. To save a
+   turn, combine keep-and-look: `observe` with `record_previous: true` keeps the pending transition
+   and returns the already-cached new screen (the screenshot `act` just took, not a fresh capture).
+   Standalone `record` then `observe` still works as a fallback.
 5. Repeat until the step budget runs out or you genuinely have nothing new to try, then **`finish`**,
    which packages the evidence and renders `map.html`. Give it one sentence saying why you stopped.
 
@@ -39,9 +45,10 @@ and reason from that list. Do not re-read old screenshots; if you are unsure wha
 
 ## What to explore
 
-Map the whole product, not one task. When the thing you were doing is finished, blocked, or just
-repeating itself, go and find a **different kind of** part of the product — look at whatever
-navigation the screen offers.
+In discovery mode, map the whole product. When one thing is finished, blocked, or repeating, find
+a different kind of part through navigation visible on screen. In directed capture mode, keep the
+given goal and conduct policy in view: stop when the requested destination is visibly reached and
+recorded; do not turn a capture into a survey.
 
 Prefer screens you can *do* something on — sign up, create, configure, search, book, buy — over
 screens that only describe the product: documentation, blog posts, changelogs, help articles, legal
@@ -63,23 +70,28 @@ concluding the product is exhausted.
 
 ## The honesty rules — these are not negotiable
 
-- **Never evade a bot check, a paywall or a login wall.** A wall is a finding. Record how you got
-  there, say so in your report, and go somewhere else. Do not look for a back door, a different user
-  agent, an API, or a "test" route.
-- **Never log in, and never sign up.** The server refuses to type an email address, a phone number
-  or a password into a product it does not own, and it is right to. If the user wants their logged-in
-  flows mapped, they log in themselves with `releashed map <url> --login`, in their own browser.
+- **Never evade a bot check, a paywall or a login wall.** A wall is a finding. Record it and finish;
+  do not look for a back door, a different user agent, an API, or a "test" route.
+- **Never sign up or type credentials.** A stranger-mode server refuses contact details and passwords.
+  For an owner's authenticated capture, the owner may start the server with their repository's
+  supported `--auth-cmd` or an already saved `--login` session; this is bootstrap outside the walk,
+  not a navigation step.
 - **Never invent a value to get past a form.** A made-up email address is both a lie in the evidence
   and a push against a door we promised not to push.
-- **Read-only.** The boundary refuses every mutating request to the product's own origin, so a
-  purchase, a booking or a deletion cannot go through. Do not try to work around a refusal — report
-  it as the wall it is.
+- **Respect the action boundary.** Stranger mode is read-only. With explicit `--mine`, ordinary
+  own-product actions may be allowed, while payment, deletion, billing, checkout, subscriptions,
+  and account destruction remain refused. Do not work around a refusal; record it and finish.
 - **Say what you saw, not what you assume.** If you did not see a screen, it is not in the map, and
   your summary may not claim it exists.
 - Off-site links are not followed. The server puts the browser back where it was and tells you so;
   take that as a closed door and try something else.
 
 ## When you finish
+
+For a directed capture, `finish` accepts `goal_reached: true` with ordered `goal_screenshots`
+paths from `observe`/`record`. Select the requested evidence even if the walk continued afterward.
+Only recorded images qualify. Without explicit selection, the compatibility claim uses the
+current image; do not use that default when the goal was on an earlier screen.
 
 Report three things to the user: the path of `map.html`, how many transitions were recorded, and a
 short plain-English description of what the product does and which parts you could not reach and

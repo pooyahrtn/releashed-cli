@@ -2,8 +2,8 @@
 // own landing page and nothing else.
 //
 // scripts/author-public-pack.mjs is the owner-authority path: a sandboxed child, a frozen fetch
-// policy, a cap ledger, and a model call -- and lib/public-pack-fetch.mjs hardcodes the one
-// approved inburgering.coach source, so it cannot fetch anybody else. That whole ceremony exists to
+// policy, a cap ledger, and a model call -- and lib/public-pack-fetch.mjs hardcodes one single
+// approved source, so it cannot fetch anybody else. That whole ceremony exists to
 // let a MODEL write claims about a product we own. For a third-party public target none of it
 // applies: the claims here are quoted verbatim out of the page's own markup by plain code, so there
 // is no model call to bound, no cap to spend, and nothing to sandbox. Deterministic code over a
@@ -110,7 +110,7 @@ export async function authorTargetPack(url, fetchImpl = fetch) {
   const response = await fetchImpl(initialUrl, {
     redirect: "follow",
     headers: {
-      "user-agent": "flow-map-lab-public-pack-author/1.0 (+https://releashed.io; reads one public page)",
+      "user-agent": "releashed-public-pack-author/1.0 (+https://releashed.io; reads one public page)",
       accept: "text/html,application/xhtml+xml",
     },
     signal: AbortSignal.timeout(30_000),

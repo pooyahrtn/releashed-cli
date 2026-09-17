@@ -29,8 +29,13 @@ function parseArgs(argv) {
   return {
     url: url.href,
     name: args["--name"],
+    // A saved session is a real credential, so it never lands inside the package. The default is
+    // the same output root the CLI itself uses (RELEASHED_OUT, else ./releashed), which is
+    // gitignored; `releashed login` always passes --output-dir explicitly, and anyone keeping
+    // sessions in a separate private checkout points --output-dir or RELEASHED_OUT at it.
     outputDir: resolve(
-      args["--output-dir"] ?? join(repository, "..", "flow-map-lab-private", "sessions"),
+      args["--output-dir"] ??
+        join(process.env.RELEASHED_OUT ?? join(repository, "releashed"), "sessions"),
     ),
   };
 }

@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "description": "Map a deployed product's user flows from its URL alone: screenshots in, an evidence-backed map out.",
   "license": "MIT",
-  "private": true,
   "type": "module",
   "bin": {
     "releashed": "bin/releashed.mjs"
@@ -14,35 +13,39 @@
     "scripts/vision-explorer-run.mjs",
     "scripts/vision-explorer-spike.mjs",
     "scripts/map-mcp.mjs",
+    "scripts/capture-memory-mcp.mjs",
     "scripts/capture-session.mjs",
     "scripts/author-target-pack.mjs",
     "scripts/caption-screens.mjs",
     "scripts/package-candidate.mjs",
-    "scripts/prepare-bounded-onboarding-run.mjs",
-    "scripts/retire-completed-owner-bundle.mjs",
-    "scripts/explorer-ruler.mjs",
-    "scripts/prepare-target-run.mjs",
-    "scripts/create-owner-bundle.mjs",
-    "scripts/prepare-public-pack-run.mjs",
-    "scripts/run-production-explorer.mjs",
-    "scripts/rebind-public-pack.mjs",
-    "scripts/reconcile-recovery.mjs",
-    "scripts/trusted-control-probe.mjs",
     "renderer/",
     "skills/",
     "supervisor/",
-    "sandbox/",
     "README.md",
     "LICENSE",
-    "docs/map-schema.md"
+    "docs/map-schema.md",
+    "docs/developer-tooling.md"
   ],
   "engines": {
     "node": ">=22"
   },
+  "author": "Pooya Haratian",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pooyahrtn/releashed-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pooyahrtn/releashed-cli/issues"
+  },
   "scripts": {
+    "agent:status": "node scripts/agent-status.mjs",
+    "agent:tidy": "node scripts/agent-tidy.mjs",
+    "extract:public-cli": "node scripts/extract-public-cli.mjs",
     "capture-session": "node scripts/capture-session.mjs",
     "calibrate:control": "node scripts/trusted-control-probe.mjs",
     "reconcile:recovery": "node scripts/reconcile-recovery.mjs",
+    "gate-a-review": "node scripts/gate-a-review.mjs",
+    "preflight": "node scripts/preflight.mjs",
     "render": "node renderer/render-map.mjs",
     "caption-screens": "node scripts/caption-screens.mjs",
     "package-candidate": "node scripts/package-candidate.mjs",
@@ -50,6 +53,8 @@
     "create:owner-bundle": "node scripts/create-owner-bundle.mjs",
     "test": "node --test tests/*.test.mjs",
     "spike:vision": "node scripts/vision-explorer-spike.mjs",
+    "spike:grounding-probe": "node scripts/grounding-offset-probe.mjs",
+    "publish-map": "node scripts/publish-map.mjs",
     "map-mcp": "node scripts/map-mcp.mjs",
     "releashed": "node bin/releashed.mjs"
   },
@@ -64,13 +69,8 @@
     "ai": "7.0.93",
     "playwright": "^1.62.1"
   },
-  "author": "Pooya Haratian",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/pooyahrtn/releashed.git"
-  },
-  "homepage": "https://releashed.io",
-  "bugs": {
-    "url": "https://github.com/pooyahrtn/releashed/issues"
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "typescript": "5.9.3"
   }
 }

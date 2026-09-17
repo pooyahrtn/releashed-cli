@@ -11,36 +11,81 @@ this way, nothing hand-written.
 
 ## Install
 
-Needs Node 22 or newer. Not on npm yet, so install it from a clone of this repository:
+Needs Node 22 or newer. From a release checkout, create the archive (this does not publish it):
 
 ```sh
-cd releashed            # wherever you cloned it
-npm install
-npx playwright install chromium
-npm link                # puts `releashed` on your PATH
-releashed doctor        # do this first
+npm pack
 ```
 
-`doctor` makes one one-token model call and tells you whether your keys work, whether the balance is
-actually positive, and whether Chromium is installed — the two-minute check that saves an evening.
+Install that archive and its matching agent skills in the product environment:
 
-Everything below also works without `npm link`, as `node bin/releashed.mjs <command>`.
+```sh
+mkdir -p /tmp/releashed-install
+cp /path/to/releashed-0.1.0.tgz /tmp/releashed-install/
+npm install -g /tmp/releashed-install/releashed-0.1.0.tgz
+releashed install-skills
+```
+
+This installs the archive's own dependencies. It does not use a developer checkout or another
+project's `node_modules`. Run `releashed install-skills` from the product repository: by default
+skills go to its `.claude/skills`. Choose another location with `--destination <directory>`.
+Installed skills include `releashed-memory` for saved-evidence-only requests alongside the
+fresh-capture route. Existing skill folders are protected. Use `--replace` only when you intend to replace one with the
+packaged version. Muse Code 1.0.3 recognizes the default `.claude/skills` location as
+supported project skills; check with
+`muse skills list --source project --workspace <product-repo> --trust-workspace`.
+Suspect trust only when that output carries a `project-skills-untrusted` diagnostic.
+
+### Saved lookup needs no browser
+
+Saved lookup (searching sealed local captures) works straight after the archive install above.
+It needs no `install-browser`, no `doctor` mode, and no model keys:
+
+```sh
+releashed memory --help      # or: releashed memory -h
+releashed mcp --help         # or: releashed mcp -h
+releashed install-skills --help
+releashed memory https://app.example.com --goal "show me the session wrap" --json
+```
+
+Each `... --help` entry is side-effect-free: it prints usage, exits 0, and creates no store,
+performs no authentication and makes no paid checks. The lookup itself is read-only against
+the product's shared Git store (see below); open each returned original PNG directly and
+inspect it before relying on it.
+
+Fresh capture is separate: `releashed install-browser`, the API keys under Keys below, and
+`releashed doctor` / `releashed doctor --capture ...` belong to making new maps, not to
+reading saved evidence. Keep that setup for capture work.
+
+Plain `releashed doctor` is only for the API-driven `map` command: it makes paid key checks.
+For local checks before a signed-in caller-coordinate capture, use:
+
+```sh
+releashed doctor --capture https://app.example.com --goal "<request>" \
+  --mcp-config /path/to/private-mcp.json --server directed-capture \
+  --preparation /path/to/private-attempt.md --json
+```
+
+Run it from the product worktree that will authenticate. It checks the selected JSON `mcpServers`
+entry, exact package/goal/URL, owner mode, identity/precondition declarations, local run references,
+sign-in configuration, Chromium presence and preparation-record presence without launching anything
+or making a model call. The preparation record remains caller-authored prose or JSON; this check
+does not validate its contents. Client permission, account eligibility and cost prerequisites remain
+explicitly unverified. [Details and contributor tooling](docs/developer-tooling.md).
+Memory lookup needs neither doctor mode.
 
 ## Keys
 
-Export both, before you run `map`:
+Export both before you run API-driven `map`:
 
 ```sh
 export ANTHROPIC_API_KEY=sk-ant-...   # decides what to try next, from the screenshot
 export GEMINI_API_KEY=...             # points at the control you named
 ```
 
-Both keys stay in your own shell environment. Nothing here reads them for any purpose but the two
-calls above, nothing logs them, and nothing sends them anywhere but Anthropic's and Google's own
-APIs.
-
-`npx releashed doctor` (or `releashed doctor` after `npm link`) checks both are set and actually
-work, plus that Chromium is installed, before you spend anything on a real run.
+`releashed doctor` checks both keys and Chromium before you spend on an API-driven map. The
+shared-memory commands make no model call. `explore-mcp` uses the coding agent's screenshot
+coordinates and needs neither API key.
 
 **Two keys is one too many and we know it.** Anthropic's own model can point at a control accurately
 (measured on a small probe: 8 of 8 controls, every one inside the real element), so the second key goes away when that swap
@@ -55,7 +100,9 @@ pointing. `--budget` caps it.
 releashed doctor
 releashed map <url> [options]
 releashed login <url>
-releashed mcp <candidate-dir>
+releashed mcp [candidate-dir]
+releashed memory <url> --goal "<English>"
+releashed install-skills [--destination <directory>] [--replace]
 releashed diff <old-map-dir> <new-map-dir>
 releashed explore-mcp [<url>] [--steps N]
 ```
@@ -75,7 +122,7 @@ project's `AGENTS.md` / `CLAUDE.md` a block telling your coding agent to ask the
 | Option | What it does |
 |---|---|
 | `--model sonnet\|opus` | Sonnet (default) is half the price; **`--model opus` gives a fuller first map** — it reaches about a third more distinct pages. Sonnet for re-runs. |
-| `--steps N` | Actions the run may take, 1–60, default 40. |
+| `--steps N` | Actions the run may take, 1–250, default 40. |
 | `--minutes N` | Wall-clock budget. The run stops when it is spent. |
 | `--budget EUR` | Model-spend budget. The run stops when it is spent. |
 | `--include <globs>` | Only these paths are the product: `"/tools/**,/app/**"`. |
@@ -87,9 +134,83 @@ project's `AGENTS.md` / `CLAUDE.md` a block telling your coding agent to ask the
 | `--login` | Explore as you: uses the session you saved with `releashed login`. |
 | `--auth-cmd "<cmd>"` | Your own product: a command of yours prints the sign-in, so no human is needed. |
 | `--mine` | You own this product: the run may use it like a user (send, post, submit, reply). It still never pays, deletes, or touches billing/checkout/subscriptions/account deletion. |
+| `--goal "<objective>"` | Aim a capture at a screen or flow in your own product. Its evidence is labelled as directed. |
+| `--policy "<conduct>"` | How the walk should behave while pursuing `--goal`. |
+| `--continues <run-id>` | Capture only: record that this run continues an existing run. It does not restore the browser, replay actions or check account persistence. |
+| `--precondition "<setup>"` | Capture only: declare arranged starting state. Use `run <run-id>` to reference earlier evidence under the same output root. Setup is recorded, never sent to the walker. |
+| `--identity-label <label>` | Capture only: a nonsecret account label for the record. Omit it if unknown; never use a token or password. |
 
-Everything lands under `./releashed` in the directory you ran it from. Nothing is uploaded, and
-nothing phones home: **no telemetry, at all.**
+For a deep capture, authenticate the same account on each run, keep the goal and policy consistent,
+and check that its progress survives a fresh sign-in before relying on continuation. The capture
+metadata flags also work with `explore-mcp`. Each run has its own sealed evidence; the continuation
+pointer is supplied before packaging, never patched into a finished candidate.
+
+A walker saying it arrived produces `goal_claimed`, with its reason and the screenshot it was
+looking at. This is a claim to inspect, not independent verification. `get_flow` returns the
+directed run's provenance and claim evidence alongside its screens. A wall, error or exhausted
+budget keeps its own stop reason.
+
+For a flow requiring yesterday's activity or another backend condition, use
+[releashed-precondition](skills/releashed-precondition/SKILL.md) in the customer's repo to arrange,
+verify and declare the starting state. The walk still has to reach the destination through the
+product.
+
+Everything lands in the product's shared Git store (`.git/releashed`), so every worktree can find
+the same sealed captures. Outside Git it falls back to `./releashed`; `RELEASHED_OUT` always
+overrides either location. Nothing is uploaded, and nothing phones home: **no telemetry, at all.**
+
+### Capture memory — answer before running
+
+When an owner asks for a production screen, first search sealed local evidence:
+
+```sh
+releashed memory https://app.example.com --goal "show me the session wrap" --json
+```
+
+This is read-only: it never launches a browser, signs in, or makes a model call. It returns dated
+candidate screenshots and their provenance for an agent to inspect; a matching name or walker claim
+is not proof by itself. `releashed mcp` with no candidate path exposes the same lookup as the
+read-only `find_capture` MCP tool.
+
+Saved captures are reusable for **seven days** by default. Lookup returns `freshness.reusable`
+and the policy path; images still need inspection for the requested account and destination.
+To change the window for this product, write `{"max_age_days": 7}` to the returned
+`policy.config_path` (`memory-policy.json` beside `maps/`). Request overrides:
+
+```sh
+RELEASHED_MAX_AGE_DAYS=14 releashed memory https://app.example.com --goal "show the wrap" --json
+RELEASHED_FRESH=1 releashed memory https://app.example.com --goal "show a fresh wrap" --json
+```
+
+MCP accepts `max_age_days` and `fresh` directly. Zero days always requires a fresh capture.
+Age is measured from the oldest selected original image; selecting an image later does not
+renew it. Expired evidence remains available as dated history. Expiry never schedules a refresh,
+logs in, deletes a map, or spends money. A fresh request goes through the normal preparation and
+capture allowance. Caller-coordinate capture uses the agent's authorized subscription by default;
+separate model APIs are opt-in, and any app-side generation remains a separate expense.
+
+### Complete capture reports
+
+After inspecting the selected originals and verifying cleanup, assemble the final response locally:
+
+```sh
+releashed report <run-id> --preparation /absolute/preparation-record \
+  --cleanup /absolute/cleanup-receipt --timing /absolute/diagnostics/summary.json \
+  --phases /absolute/phases.json --inspection "What the selected images actually show"
+```
+
+The command emits Markdown with every original image/date, distinct preparation and cleanup
+links, readable local timing, and external phases/costs. `--json` returns the same Markdown and
+structured references. It makes no browser, authentication or model call, and reporting a retained
+run does not depend on its current reuse age. Broken selected images, missing/distinct-record
+violations and wrong-run timing records are errors. Record presence does not certify their claims.
+
+`phases.json` names `run_id` and the recorded ISO timestamps `request_started_at`,
+`preparation_finished_at`, `capture_finished_at`, `cleanup_finished_at`. Its `costs` object has
+nonempty `caller`, `capture`, `grounding`, `product` descriptions: an amount and basis when known,
+otherwise explicit `unknown`. Record times as they happen. Report assembly precedes final-message
+delivery, so it never invents that delivery timestamp or the unfinished caller's final bill.
+The packaged capture skill describes the complete sequence.
 
 ### `releashed login <url>` — map what only a signed-in user sees
 
@@ -164,7 +285,7 @@ screen looked like, so it changes the moment the content does — useless as an 
 one thing wrong on its own: a title that legitimately varies night to night (a count, a name) reads
 as one screen disappearing and an unrelated one appearing, rather than as a change to the same
 screen. A product with day-to-day dynamic content (today's task list, a randomised exercise, a
-rotating paywall message) will diff noisily for exactly this reason.
+rotating paywall message) will diff noisily for exactly this reason — see `docs/DECISIONS.md`.
 
 ### `releashed explore-mcp [<url>]` — let your agent be the explorer
 
@@ -172,11 +293,11 @@ rotating paywall message) will diff noisily for exactly this reason.
 claude mcp add releashed-explore -- releashed explore-mcp https://play.grafana.org
 ```
 
-Same browser, same boundary, same evidence — but your agent supplies the eyes, so it costs no model
-key of ours and no spend of yours beyond your own subscription. Four tools: `observe`, `act`,
-`record`, `finish`. Copy `skills/releashed-explore/SKILL.md` into your `.claude/skills/` and the
-agent knows how to run the loop, including the honesty rules below. (The pointing key is still
-needed here too, for now.) Add `--mine` if you own the product, exactly as `releashed map --mine`
+Same browser, same boundary, same evidence — but your agent supplies the eyes and the pixel
+coordinate it sees, so it makes no separate model or grounding call. The coding agent's ordinary
+inference and any product costs still apply. Four tools: `observe`, `act`,
+`record`, `finish`. `releashed install-skills` installs the matching skills, including
+`releashed-capture`, which checks retained evidence before starting a directed capture. Add `--mine` if you own the product, exactly as `releashed map --mine`
 does: ordinary product use is allowed, pay/delete and billing/checkout/subscription/account-deletion
 stay refused.
 
@@ -221,23 +342,14 @@ metrics.json                 tokens, cost in EUR, every request the boundary saw
 production-run-report.json   how the run ended
 ```
 
-## Running the tests
-
-```sh
-npm install
-npx playwright install chromium
-npm test
-```
-
-`npm test` runs `node --test tests/*.test.mjs` — plain Node's built-in test runner, no framework.
-The tests are the clearest description of the safety rules above: what a read-only run refuses to
-type, which requests the request boundary blocks, what gets redacted before anything is retained,
-what a bot wall or a login wall does to a run. Two of them drive a real, visible-if-you-remove-
-headless Chromium instance (`bounded-onboarding.test.mjs` and the fresh-auth-boundary reseal test in
-`fresh-auth-boundary.test.mjs`) and can occasionally flake when the whole suite runs under load on a
-busy machine; they pass reliably run alone (`node --test tests/bounded-onboarding.test.mjs`).
-
 ## Licence and status
 
-MIT. Early: the CLI and the two MCP servers work. The Anthropic-only grounder swap mentioned above
-and anything hosted (a dashboard, a scheduler) do not exist yet. Issues and pull requests welcome.
+MIT. Early: the CLI and the two MCP servers work; the grounder swap, flow diffing against a previous
+run, and anything hosted do not exist yet. Issues and pull requests welcome.
+
+---
+
+This repository is also the lab the tool was built in, so it carries more than the tool: see
+[AGENTS.md](AGENTS.md) for how the lab works, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how
+the pieces fit, [docs/CONTROL-SURFACE.md](docs/CONTROL-SURFACE.md) for what ships when, and
+[docs/DECISIONS.md](docs/DECISIONS.md) for why each call was made.

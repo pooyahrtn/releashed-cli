@@ -19,8 +19,13 @@
 // retained visible-state evidence the renderer hashes and the reviewer reads, exactly as in the
 // old stack, and it never enters a model prompt. Same standing as the spike's DOM verification.
 //
-// Usage: every target needs a --target-config file naming its auth mode (clerk / saved-session /
-// public) and the public pack it packages against -- there is no built-in default target.
+// Usage:
+//   SPIKE_APP_URL=http://localhost:8110 \
+//     node --env-file=/path/to/.env.local scripts/vision-explorer-run.mjs --steps 24
+//
+// A target other than the built-in one (not on Clerk) runs with a --target-config file, either
+// with a saved browser session or (authMode "public") no identity at all -- just whatever a
+// logged-out visitor can reach:
 //   SPIKE_APP_URL=https://app.cal.com \
 //     node --env-file=/path/to/.env.local scripts/vision-explorer-run.mjs --steps 60 \
 //     --target-config targets/calcom.json
@@ -31,12 +36,17 @@ import {
   budgetExhausted,
   checkActionAuthorized,
   detectWall,
+  noEffectNote,
   onBoundOrigin,
+  waitAllowance,
   FORBIDDEN_VERBS,
+  MAX_STEPS,
   OWNER_FORBIDDEN_VERBS,
+  RUN_WAIT_BUDGET_MS,
 } from "../lib/run-limits.mjs";
 import {
   buildTransitionEvent,
+  focusedTarget,
   identifyTarget,
   observeScreen,
   pad,
@@ -47,6 +57,12 @@ import { PlaywrightAgent } from "@midscene/web/playwright";
 import { chromium } from "playwright";
 import { explorerModel } from "../lib/explorer-client.mjs";
 import { isAuthFlowUrl, modelCostEur, priceSourceFor, sha256Text } from "../lib/scaffold.mjs";
+import { assertRunId, validateCaptureMetadata } from "../lib/capture-metadata.mjs";
+// Same rule the MCP finish route enforces (lib/explore-mcp.mjs): a goal claim may only cite a
+// screenshot the recorded trace retains, and that file must be re-read and match its recorded
+// hash. `recordedSelection` and `digest` are the exact functions that route uses -- reused here
+// rather than re-implemented, so both explorer engines converge on the one contract.
+import { recordedSelection, digest } from "../lib/capture-selection.mjs";
 import {
   EXPLORER_MODEL,
   EXPLORER_SYSTEM,
@@ -59,7 +75,7 @@ import {
 } from "./vision-explorer-spike.mjs";
 
 // Fallback viewport for a target that names no --target-config, or one whose config omits
-// "viewport" -- unchanged, so an existing target keeps this exact phone size.
+// "viewport" -- unchanged, so the original built-in target keeps this exact phone size.
 const DEFAULT_VIEWPORT = { width: 390, height: 844 };
 
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -73,8 +89,19 @@ const scrub = (text) =>
 // auth) closes over the spike module's own copy of that variable, so a flag here could silently
 // disagree with it. What --target-config adds is everything ELSE about a target (whether it's
 // worth an allow-list entry at all, how to sign in, which public-pack hash it packages against).
-// There is no built-in default target -- every target, including a local one, is approved by
-// writing it a --target-config file.
+// The default (no --target-config) is the ORIGINAL single-entry allow-list, unchanged.
+const APPROVED_TARGETS = new Set(["https://app.inburgering.coach"]);
+// The run report's public-pack hash the packager has always checked for the built-in target (see
+// package-candidate.mjs / lib/candidate-packager.mjs). Any other target must supply its own, via
+// --target-config -- silently reusing this one for a different product would let a mismatched
+// pack through packaging without ever being noticed.
+const DEFAULT_PUBLIC_PACK_SHA256 = "acfdafff0f2dc20d342bab3f7d8a18e40750b50137cd83103c78ea8c5ba9ca37";
+// The exact file DEFAULT_PUBLIC_PACK_SHA256 above must hash to -- see verifyPublicPackHash().
+const DEFAULT_PUBLIC_PACK_PATH = resolve(
+  import.meta.dirname,
+  "..",
+  "packs/public-pack-spike-a-live-calibration-20260903T164116Z/public-pack.json",
+);
 
 // A malformed hash (not 64 hex chars) was already rejected before this existed. A well-formed but
 // WRONG hash was not: it passed config-load, ran the whole exploration, and only failed at
@@ -102,6 +129,14 @@ export function options(argv) {
     // The other two budgets. Null means unbounded, which is exactly today's behavior.
     minutes: null,
     maxEur: null,
+    // Capture mode (S-5), and ONLY when the owner asks for it: the one standing objective this run
+    // pursues, and a short plain-English note on how to behave while pursuing it. Both null is
+    // discovery -- source-blind, no goal, no hints -- which is every run that does not pass them.
+    goal: null,
+    policy: null,
+    continues: null,
+    precondition: null,
+    identityLabel: null,
     // Where the retained run is written. The default is the installation's own runs/ directory,
     // byte-for-byte where every existing run went; the CLI passes a directory in the user's project
     // instead, so a global install never writes inside node_modules.
@@ -113,10 +148,21 @@ export function options(argv) {
     else if (argv[i] === "--minutes") values.minutes = Number(argv[i + 1]);
     else if (argv[i] === "--budget-eur") values.maxEur = Number(argv[i + 1]);
     else if (argv[i] === "--run-dir") values.runDirRoot = resolve(argv[i + 1]);
+    else if (argv[i] === "--goal") values.goal = argv[i + 1];
+    else if (argv[i] === "--policy") values.policy = argv[i + 1];
+    else if (argv[i] === "--continues") values.continues = assertRunId(argv[i + 1]);
+    else if (argv[i] === "--precondition") values.precondition = argv[i + 1];
+    else if (argv[i] === "--identity-label") values.identityLabel = argv[i + 1];
     else throw new Error(`Unknown argument ${argv[i]}`);
   }
-  if (!Number.isInteger(values.steps) || values.steps < 1 || values.steps > 60)
-    throw new Error("--steps must be 1..60");
+  // A policy says how to behave while chasing a goal. On its own it would be a sentence of the
+  // owner's own words entering a source-blind walk, which discovery mode does not take.
+  if (values.policy && !values.goal) throw new Error("--policy describes how to behave while pursuing a --goal; pass one");
+  if (values.precondition !== null && !values.precondition.trim()) throw new Error("--precondition must be non-empty plain English");
+  if ((values.continues || values.precondition || values.identityLabel) && !values.goal)
+    throw new Error("--continues, --precondition, and --identity-label need --goal");
+  if (!Number.isInteger(values.steps) || values.steps < 1 || values.steps > MAX_STEPS)
+    throw new Error(`--steps must be 1..${MAX_STEPS}`);
   if (values.minutes !== null && !(values.minutes > 0)) throw new Error("--minutes must be a positive number");
   if (values.maxEur !== null && !(values.maxEur > 0)) throw new Error("--budget-eur must be a positive number");
   return values;
@@ -124,11 +170,32 @@ export function options(argv) {
 
 // Resolves everything about WHICH target this run drives, beyond the origin itself (already fixed
 // by SPIKE_APP_URL): the auth mode, the saved-session file (if any), and the public-pack hash the
-// run report will carry. There is no built-in default target -- a target is approved by writing it
-// a --target-config file, full stop.
+// run report will carry. This IS the allow-list now -- with no --target-config, only the original
+// built-in origin (or localhost) is accepted, exactly as before. A new target is approved
+// by writing it a config file, not by editing this function.
 export async function resolveTarget(app, targetConfigPath) {
   if (!targetConfigPath) {
-    throw new Error("Pass --target-config for this target -- there is no built-in default target");
+    if (!(app?.startsWith("http://localhost") || APPROVED_TARGETS.has(app)))
+      throw new Error(
+        "SPIKE_APP_URL must be a http://localhost target or an approved production target (or pass --target-config for a new one)",
+      );
+    await verifyPublicPackHash(DEFAULT_PUBLIC_PACK_PATH, DEFAULT_PUBLIC_PACK_SHA256, "the built-in default target");
+    return {
+      authMode: "clerk",
+      publicPackSha256: DEFAULT_PUBLIC_PACK_SHA256,
+      savedSessionPath: null,
+      allowedOrigins: [new URL(app).origin],
+      viewport: DEFAULT_VIEWPORT,
+      viewports: [DEFAULT_VIEWPORT],
+      // The original built-in path is unaffected by read-only mode: we own this target,
+      // so its normal (denylist-based) mutation handling in classifyRequest keeps applying.
+      readOnly: false,
+      mine: false,
+      pathScope: { include: [], exclude: [] },
+      forbidden: [],
+      seedValues: [],
+      uploadPath: null,
+    };
   }
   let config;
   try {
@@ -176,8 +243,8 @@ export async function resolveTarget(app, targetConfigPath) {
       throw new Error(`--target-config "additionalOrigins" entry is not a normalized origin: ${raw}`);
   }
   const allowedOrigins = [...new Set([new URL(app).origin, ...additionalOrigins])];
-  // Per-target viewport, defaulting to the original phone size so every existing target (including
-  // an existing target) is unaffected unless it opts in.
+  // Per-target viewport, defaulting to the original phone size so every existing target (the
+  // built-in one included) is unaffected unless it opts in.
   const viewport = config.viewport ?? DEFAULT_VIEWPORT;
   if (
     !Number.isInteger(viewport.width) ||
@@ -290,7 +357,7 @@ export async function loadSavedSession(page, cdp, app, savedSessionPath) {
 // loadSavedSession(), landing on something that looks like a sign-in/reset page is not an error --
 // exploring exactly that logged-out surface (marketing pages, signup steps, sign-in, password
 // reset) is the point of this mode, so there is no isAuthFlowUrl() check here.
-// "networkidle" is not a promise a stranger's site makes. some sites never go idle -- an
+// "networkidle" is not a promise a stranger's site makes. brandfetch.com never goes idle -- an
 // analytics beacon, a chat widget or an autoplaying video keeps a request in flight -- so a hard
 // `waitUntil: "networkidle"` threw `page.goto: Timeout 30000ms exceeded` and ended the run before
 // the first screenshot. Land on domcontentloaded, which every page reaches, then give idle a short
@@ -402,10 +469,56 @@ once breadth runs out.
 Keep each instruction to one action on one control, described the way a person would point at it
 on the screen, so that whoever carries it out cannot mistake which control you mean.
 
+Some screens move on by themselves and no click will hurry them along. When that is plainly what
+you are looking at, reply with "action":"wait" (no target, no text) and time will pass before your
+next look at the screen. There is only so much waiting in a run, so spend it on a screen that is
+actually going somewhere on its own, not on one that has simply stopped responding to you.
+
 Only set "done":true when you genuinely cannot see any unexplored part left, and then put the
 reason in "why".`;
 // The brief must stay above Anthropic's 1024-token minimum cacheable prefix; at 1022 tokens the
 // cache breakpoint was silently ignored on every turn (W2-9, 2026-09-06).
+
+// Capture mode's brief, and the ONE place a goal is allowed to exist. Everything above is the
+// discovery brief and stays exactly as it is: with no goal this returns MISSION itself, byte for
+// byte, so a run without --goal is the run we have always had. With a goal, the objective is
+// appended -- the whole brief is one cached system prompt, so it is in front of the model on every
+// turn, not just the first -- and it says plainly that it overrides the roaming preference above
+// it. The goal is the owner's own sentence, passed through untouched: nothing here reads source,
+// names a screen, or suggests a route to it.
+export function explorerBrief(goal = null, policy = null) {
+  if (!goal) return MISSION;
+  return `${MISSION}
+
+Everything above is how to roam a product you are surveying in general. This run is not that run.
+It has ONE standing objective, and that objective stands on every turn until it is met:
+
+  ${goal}
+
+Pursue it. Where the guidance above would have you leave for a different part of the product for
+breadth's sake, ignore that and keep going towards the objective; a screen that does not bring you
+nearer to it is a screen to leave. If what you tried turns out to be a dead end, back out and look
+for another way to the same objective rather than taking up something else instead.
+
+Nobody has told you where the objective lives or what it looks like, and nothing here will: find it
+the way a person who had been asked for it would, by looking at what is on the screen. The moment
+you are looking at it, you are finished -- set "done":true and say in "why" what you can see that
+tells you the objective is met.
+
+You are finished only when the screen in front of you IS the objective. Believing the next click
+would show it is not being finished: take the click, then look. A screen that says the work is over
+is not the screen the product shows afterwards, and "this should confirm it" means you have not
+confirmed it. If you stop one action short and say you arrived, the picture you were sent for does
+not exist and nobody will know until they open it (2026-09-06: a run did exactly this). If you become certain you cannot get there, set "done":true and say
+in "why" what stopped you.${
+    policy
+      ? `
+
+How the person running this asked you to behave along the way, which is about conduct and never
+about where to click: ${policy}`
+      : ""
+  }`;
+}
 
 
 // Re-exported from lib/explorer-evidence.mjs, where the option-D MCP server shares it.
@@ -441,7 +554,7 @@ export function reanchorLastEvent(events, evidence) {
     last.before.screenshot_sha256 !== evidence.screenshot_sha256;
   last.transition_kind = changed ? "solid" : "none";
   last.observed_outcome = changed
-    ? { click: "clicked", type: "typed", scroll: "scrolled" }[last.intended_action.method]
+    ? { click: "clicked", type: "typed", scroll: "scrolled", wait: "waited" }[last.intended_action.method]
     : "no-visible-effect";
   last.outcome_detail = changed
     ? null
@@ -449,11 +562,119 @@ export function reanchorLastEvent(events, evidence) {
   return superseded;
 }
 
+// This route took `state.evidence.screenshot_path` on trust the moment the explorer said `done`,
+// with no check that a goal claim cite retained evidence -- an unenforced hole, not (as first
+// suspected while chasing the 2026-09-17 incident) the cause of it: every one of that day's
+// `goal_claimed` runs, re-checked against the untouched evidence, cites a screenshot that IS in
+// its recorded trace and DOES hash-match the file on disk; their failure was elsewhere. This closes
+// the hole anyway and converges both explorer engines onto the one contract the MCP finish route
+// already enforces (lib/explore-mcp.mjs): the claimed path must be retained evidence -- named by a
+// recorded event's `before`/`after` (`recordedSelection` throws otherwise), or, when no event
+// exists yet to name it, the raw pre-loop observation itself (`observedEvidence` below) -- and the
+// file it names must still be on disk and hash to what was recorded when it was captured.
+// No browser, no network, no model call -- just the trace already in memory and one file read.
+export async function verifyGoalClaim({ events, claimScreenshotPath, observedEvidence, readScreenshotBytes }) {
+  if (!claimScreenshotPath)
+    return { verified: false, reason: "no goal screenshot was captured to claim" };
+  let recorded;
+  if (events.length === 0) {
+    // Step 1, before any action has been dispatched: `events` is still empty, so nothing has gone
+    // through the trace yet -- but the entry screen was still observed and written to disk before
+    // the loop started, with its own hash recorded the moment it was captured (see observeScreen).
+    // That is retained evidence too: a goal genuinely visible on the landing screen ("show me the
+    // signed-in dashboard", where sign-in lands straight on it) must still be able to seal
+    // `goal_claimed`, the same as the MCP finish route's own zero-event blocked-wall claim binds to
+    // the raw observed wall screenshot rather than refusing for want of an event. A single-shot CLI
+    // run has no retry to fall back on, so refusing this shape outright (as the MCP route does,
+    // recoverably, for its own zero-event goal claim) would terminally fail every one-screen goal.
+    if (observedEvidence?.screenshot_path !== claimScreenshotPath)
+      return {
+        verified: false,
+        reason:
+          "nothing had been recorded yet, and the claim does not match what was actually observed",
+      };
+    recorded = observedEvidence;
+  } else {
+    // Once at least one step has been recorded, the claim must name evidence the TRACE retains,
+    // not merely something that was once on screen -- this is the actual hole: a claim can outrun
+    // an already-nonempty trace (fall behind the events that update it, be moved back to a screen
+    // no event notes, etc.), and that must still refuse, no observedEvidence fallback.
+    let selected;
+    try {
+      selected = recordedSelection(events, [claimScreenshotPath]);
+    } catch (error) {
+      return { verified: false, reason: error?.message ?? String(error) };
+    }
+    recorded = selected[0];
+  }
+  try {
+    const bytes = await readScreenshotBytes(recorded.screenshot_path);
+    if (!bytes?.length || digest(bytes) !== recorded.screenshot_sha256)
+      return {
+        verified: false,
+        reason: `${recorded.screenshot_path} is empty or no longer matches its recorded hash`,
+      };
+  } catch (error) {
+    return {
+      verified: false,
+      reason: `${recorded.screenshot_path} could not be re-read: ${error?.message ?? error}`,
+    };
+  }
+  return { verified: true, item: recorded };
+}
+
+// The stop-decision and result-sealing logic for an explorer "done" turn, extracted so it is
+// reachable from a plain test with no browser, no network and no model call. A pure function of
+// its inputs only -- it never seals a claim itself; it reflects the `verification` it is handed.
+//
+// With no goal this is unchanged: "done" always means "nothing left to explore". With one, an
+// UNVERIFIED claim must never become `goal_claimed` -- it is sealed with the CLI's own existing
+// not-reached stop reason instead (`goal_not_reached`, the same code lib/candidate-packager.mjs
+// and the MCP route already treat as "aimed, retained evidence, not the claimed goal"), and its
+// detail keeps the explorer's own claim text rather than discarding it -- labelled, not silenced.
+// The generic not-reached wrapping near the end of main() (goal && stopReason !== "goal_claimed")
+// then prefixes "The goal was not reached." and appends the last screen, exactly as it already
+// does for a wall or a budget stop; this seals through that same path rather than a parallel one.
+export function sealDoneDecision({ goal, step, decisionWhy, claimScreenshotPath, verification }) {
+  if (!goal) {
+    return {
+      stopReason: "explicit_done",
+      stopDetail: decisionWhy ?? "The explorer reported it had nothing left to explore.",
+      goalReachedAtStep: null,
+      goalScreenshotPath: null,
+    };
+  }
+  const claimText = decisionWhy ?? "The explorer said it was looking at the goal.";
+  if (verification.verified) {
+    return {
+      stopReason: "goal_claimed",
+      stopDetail: `Claimed at step ${step}. ${claimText}`,
+      goalReachedAtStep: step,
+      goalScreenshotPath: claimScreenshotPath,
+    };
+  }
+  return {
+    stopReason: "goal_not_reached",
+    stopDetail:
+      `The explorer claimed the goal at step ${step} ("${claimText}"), but the claim could not ` +
+      `be bound to retained evidence: ${verification.reason}.`,
+    goalReachedAtStep: null,
+    goalScreenshotPath: null,
+  };
+}
 
 async function main() {
-  const { app, steps: maxSteps, targetConfigPath, minutes, maxEur, runDirRoot } = options(process.argv.slice(2));
+  const { app, steps: maxSteps, targetConfigPath, minutes, maxEur, runDirRoot, goal, policy, continues, precondition, identityLabel } = options(process.argv.slice(2));
+  // Discovery with no goal, capture with one. The brief is built once and never changes mid-run.
+  const brief = explorerBrief(goal, policy);
   const target = await resolveTarget(app, targetConfigPath);
-  // sk_live is the production instance that owns the app's own Clerk domain. Both are accepted; which
+  // This is intentionally before credentials, identity creation, browser launch, and model keys.
+  // A continuation is a pointer only; no old instruction or click enters this run.
+  await validateCaptureMetadata({
+    goal, policy, continues, precondition, identityLabel, runsRoot: runDirRoot,
+    mapsRoot: join(resolve(runDirRoot), "..", "maps"),
+  });
+  // sk_live is the production instance that owns the built-in target's own Clerk domain. Both are accepted; which
   // one is in the environment is what decides whether the disposable identity is a dev or a real
   // account, and the identity is deleted on every terminal path either way. Only checked in
   // clerk mode -- a saved-session target isn't on Clerk at all and needs no such key.
@@ -514,6 +735,10 @@ async function main() {
   // at 32, Val Town at 60. This is the counter the message always described -- reset by any step
   // that actually dispatched.
   let consecutiveUnexecutable = 0;
+  // The two counters behind the breaker and the wait budget: how many steps in a row have changed
+  // nothing on screen, and how much of the run's total waiting time is already spent.
+  let consecutiveNoEffect = 0;
+  let waitedMs = 0;
   // Doors the guard below refuses to walk through (e.g. a social sign-in button that leaves the
   // bound origin). Nothing is dispatched, so -- exactly like `unexecutable` above -- there is no
   // observed transition to add to the trace; this is bookkeeping, not evidence. Reusing the
@@ -522,6 +747,8 @@ async function main() {
   const blocked = [];
   let stopReason = "step_budget_exhausted";
   let stopDetail = "The step budget ran out before the explorer said it was finished.";
+  let goalReachedAtStep = null;
+  let goalScreenshotPath = null;
   let failure = null;
 
   // VISION_CLERK_USER_ID reuses a disposable identity already created for this run -- the grounding
@@ -683,7 +910,7 @@ async function main() {
           .filter(Boolean)
           .join("\n\n");
         decision = await withRetries("explorer decision", 3, () =>
-          decide(anthropic, state.png, history, explorerUsage, MISSION, pageContext),
+          decide(anthropic, state.png, history, explorerUsage, brief, pageContext),
         );
       } catch (error) {
         stopReason = "explorer_error";
@@ -695,11 +922,52 @@ async function main() {
         `\n[${step}] sees "${decision.screen}" -> "${decision.instruction}"\n    why: ${decision.why}`,
       );
       if (decision.done) {
-        stopReason = "explicit_done";
-        stopDetail = decision.why ?? "The explorer reported it had nothing left to explore.";
+        // "Done" means one thing in each mode, and the stop reason has to say which: with no goal
+        // it is "there is nothing left to explore"; with one it is "I am looking at what you asked
+        // for" -- but only when that claim can be bound to retained evidence.
+        // This is the image the explorer was looking at when it claimed the goal. It is an
+        // existing evidence path, not a new final screenshot or a guessed filename -- but nothing
+        // previously checked that the recorded trace (or, at step 1, the raw entry observation)
+        // actually retains it, so it is verified rather than just carried through.
+        const claimScreenshotPath = goal ? state.evidence.screenshot_path : null;
+        const verification = goal
+          ? await verifyGoalClaim({
+              events,
+              claimScreenshotPath,
+              observedEvidence: state.evidence,
+              readScreenshotBytes: (path) => readFile(join(runDir, path)),
+            })
+          : { verified: true };
+        const sealed = sealDoneDecision({
+          goal,
+          step,
+          decisionWhy: decision.why,
+          claimScreenshotPath,
+          verification,
+        });
+        stopReason = sealed.stopReason;
+        stopDetail = sealed.stopDetail;
+        goalReachedAtStep = sealed.goalReachedAtStep;
+        goalScreenshotPath = sealed.goalScreenshotPath;
         break;
       }
 
+
+      // A wait is not an action: nothing is dispatched, no request crosses the action boundary, and
+      // the pre-dispatch gate below has nothing to authorize -- so it is skipped rather than
+      // refused (checkActionAuthorized would correctly call "wait" an unsupported action). It still
+      // costs a step, still gets its own before/after screenshots, and still runs the wall check at
+      // the bottom of this step, so a bot check or a rate limit that appears while time passes ends
+      // the run exactly as one after a click does. Waiting is never a way to sit a wall out.
+      const waiting = decision.action === "wait";
+      const waitMs = waiting ? waitAllowance(waitedMs) : 0;
+      if (waiting && waitMs === 0) {
+        history.push(
+          `(there is no waiting time left: a run may wait ${RUN_WAIT_BUDGET_MS / 1000} seconds in total and this one has used all of it. Waiting again will not work -- do something else on the screen, or say you are done.)`,
+        );
+        console.log(`    WAIT BUDGET: the run's ${RUN_WAIT_BUDGET_MS / 1000}s of waiting is spent`);
+        continue;
+      }
 
       // Our own pre-dispatch gate. Nothing reaches the browser that is not one of these four
       // reversible input kinds aimed at the bound local origin -- this is the authorization the
@@ -710,7 +978,9 @@ async function main() {
       // has a few doors like this (social sign-in, payment processors, help widgets, app stores),
       // so a refusal here is recorded as a blocked, unknown-terminal door and exploration moves on
       // to the next decision -- it does not end the run.
-      const authCheck = checkActionAuthorized(decision, boundary.origins, page.url(), target.readOnly, limits);
+      const authCheck = waiting
+        ? { authorized: true, reason: null }
+        : checkActionAuthorized(decision, boundary.origins, page.url(), target.readOnly, limits);
       if (!authCheck.authorized) {
         const reason = authCheck.reason;
         blocked.push({ instruction: decision.instruction, target: decision.target ?? null, transition_kind: "unknown-terminal", reason });
@@ -724,40 +994,50 @@ async function main() {
       const mutationsBefore = boundary.sameOriginMutations;
       let outcome;
       let identified = { tier: "positional", ref: null };
-      try {
-        if (decision.action === "tap") {
-          // Split out of the shared executor on purpose: what sits under the grounded point has to
-          // be read while the page is still in its BEFORE state. One grounding call, then identify,
-          // then dispatch -- asking afterwards would read whatever the click had already replaced.
-          const located = await agent.aiLocate(decision.target);
-          const [x, y] = Array.isArray(located.center)
-            ? located.center
-            : [located.center.x, located.center.y];
-          identified = await identifyTarget(page, state.refs, x, y);
-          await page.mouse.click(x, y);
-          outcome = { executor: "midscene:aiLocate + our click", center: [x, y] };
-        } else {
-          outcome = await execute(agent, page, decision);
+      if (waiting) {
+        waitedMs += waitMs;
+        await page.waitForTimeout(waitMs);
+        outcome = { executor: `waited ${(waitMs / 1000).toFixed(1)}s` };
+      } else {
+        try {
+          if (decision.action === "tap") {
+            // Split out of the shared executor on purpose: what sits under the grounded point has to
+            // be read while the page is still in its BEFORE state. One grounding call, then identify,
+            // then dispatch -- asking afterwards would read whatever the click had already replaced.
+            const located = await agent.aiLocate(decision.target);
+            const [x, y] = Array.isArray(located.center)
+              ? located.center
+              : [located.center.x, located.center.y];
+            identified = await identifyTarget(page, state.refs, x, y);
+            await page.mouse.click(x, y);
+            outcome = { executor: "midscene:aiLocate + our click", center: [x, y] };
+          } else {
+            outcome = await execute(agent, page, decision);
+            // Typing does not have a coordinate to identify beforehand. Read the focused control
+            // immediately after the successful dispatch, before the next observation can replace
+            // it, so evidence names the field rather than a positional guess.
+            if (decision.action === "type") identified = await focusedTarget(page, state.refs);
+          }
+        } catch (error) {
+          // The executor refused to guess a coordinate, so no input was dispatched. There is no
+          // observed transition to record -- an attempted instruction is not evidence.
+          const message = scrub(error?.message ?? error);
+          unexecutable.push({ instruction: decision.instruction, target: decision.target, message });
+          consecutiveUnexecutable += 1;
+          history.push(
+            `(the previous instruction could not be carried out: nothing on screen matched "${decision.target}")`,
+          );
+          console.log(`    NOT EXECUTED: ${message}`);
+          if (consecutiveUnexecutable >= 3) {
+            stopReason = "executor_could_not_locate_target";
+            stopDetail = `Exploration stopped after three instructions in a row that nothing on screen matched, the last being "${decision.instruction}".`;
+            break;
+          }
+          continue;
         }
-      } catch (error) {
-        // The executor refused to guess a coordinate, so no input was dispatched. There is no
-        // observed transition to record -- an attempted instruction is not evidence.
-        const message = scrub(error?.message ?? error);
-        unexecutable.push({ instruction: decision.instruction, target: decision.target, message });
-        consecutiveUnexecutable += 1;
-        history.push(
-          `(the previous instruction could not be carried out: nothing on screen matched "${decision.target}")`,
-        );
-        console.log(`    NOT EXECUTED: ${message}`);
-        if (consecutiveUnexecutable >= 3) {
-          stopReason = "executor_could_not_locate_target";
-          stopDetail = `Exploration stopped after three instructions in a row that nothing on screen matched, the last being "${decision.instruction}".`;
-          break;
-        }
-        continue;
+        consecutiveUnexecutable = 0;
+        await page.waitForTimeout(1_500);
       }
-      consecutiveUnexecutable = 0;
-      await page.waitForTimeout(1_500);
 
       // A dispatched click can commit a top-level navigation off the target's own origin(s) -- an
       // off-site link, or one the executor rewrites from target="_blank" into this same tab. The
@@ -794,8 +1074,11 @@ async function main() {
         continue;
       }
 
-      const method =
-        decision.action === "tap" || decision.action === "drag" ? "click" : decision.action;
+      const method = waiting
+        ? "wait"
+        : decision.action === "tap" || decision.action === "drag"
+          ? "click"
+          : decision.action;
 
       const before = state.evidence;
       stateIndex += 1;
@@ -838,6 +1121,17 @@ async function main() {
       console.log(
         `    ${outcome.executor} | ${changed ? "screen CHANGED" : "no visible effect"} | target ${identified.tier}${identified.ref ? ` (${identified.ref})` : ""} | ${after.url}`,
       );
+      // The breaker. A step that changed nothing -- a click, a type, a scroll, or a wait, since
+      // waiting forever is the same failure as clicking forever -- adds to the streak; any step
+      // that did something clears it. From three in a row the walk is told plainly, in the same
+      // history it reads its own instructions back from, so it arrives on the next turn.
+      consecutiveNoEffect = changed ? 0 : consecutiveNoEffect + 1;
+      const stuck = noEffectNote(consecutiveNoEffect);
+      if (stuck) {
+        history.push(stuck);
+        console.log(`    STUCK: ${consecutiveNoEffect} steps in a row with no visible effect`);
+      }
+
       // A bot check that appears mid-run ends it exactly as one at the front door does -- after the
       // transition that reached it is recorded, so the wall is IN the map rather than only in the log.
       const wall = detectWall(after.url, after.visible_state_summary);
@@ -881,6 +1175,14 @@ async function main() {
     }
   }
 
+  // A directed run that ran out of budget, hit a wall or errored has to answer the question it was
+  // asked, and the honest answer is "not there, and here is where I got to instead" -- never the
+  // bare budget line, which reads as if the goal was never the point.
+  if (goal && stopReason !== "goal_claimed")
+    stopDetail = `The goal was not reached. ${stopDetail} The last screen it stood on was ${
+      events.at(-1)?.current_url ?? "the page it started on"
+    }.`;
+
   const costEur = modelCostEur(EXPLORER_MODEL, explorerUsage);
   // String fields only: a "<number>" substituted into a numeric field would not be JSON any more.
   const redactRecordText = (value) =>
@@ -899,6 +1201,23 @@ async function main() {
       {
         status: failure ? "failed" : "done",
         stop_reason: stopReason,
+        // The label that makes a directed map honest: this run was aimed, and here is the sentence
+        // it was aimed with. A free walk carries no such key at all -- see docs/map-schema.md.
+        auth_mode: target.authMode ?? null,
+        // Only the explicit command-line label is retained. In particular, do not derive one
+        // from a saved-session filename or any credential-bearing data.
+        identity_label: identityLabel ?? null,
+        ...(goal
+          ? {
+              directed_by: goal,
+              ...(policy ? { policy } : {}),
+              ...(continues ? { continues } : {}),
+              ...(precondition ? { precondition } : {}),
+              ...(stopReason === "goal_claimed"
+                ? { goal_claimed_at_step: goalReachedAtStep, goal_screenshot_path: goalScreenshotPath }
+                : {}),
+            }
+          : {}),
         // Every one of these quotes the instruction it is about, so a contact detail comes back in
         // through the refusal text even when the action itself never ran: the read-only typing
         // guard correctly blocked "Type 'testmapper2024@example.com' ..." and then the block
@@ -940,7 +1259,7 @@ async function main() {
         action_boundary: {
           installed: "raw CDP Fetch.requestPaused, attached before the executor",
           // Honest labeling of what this run was allowed to do to its own origin: "owner" when
-          // --mine was set (or the target is fully trusted, e.g. the built-in inburgering.coach
+          // --mine was set (or the target is fully trusted, e.g. the built-in APPROVED_TARGETS
           // path, readOnly: false), "stranger" otherwise -- see docs/CONTROL-SURFACE.md.
           mode: target.mine || !target.readOnly ? "owner" : "stranger",
           one_way_probe: boundary.probe ?? null,

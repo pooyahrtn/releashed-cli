@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, realpath, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { sha256File, sha256Text } from "../lib/scaffold.mjs";
 import { validatePublicPack } from "../lib/public-pack-schema.mjs";
@@ -243,7 +243,7 @@ export async function validateTrace({ tracePath }) {
         // visually (a word filling the answer box, a scroll repainting the viewport).
         (event.before.observation_hash === event.after.observation_hash &&
           event.before.screenshot_sha256 === event.after.screenshot_sha256) ||
-        !["navigate", "click", "type", "scroll"].includes(
+        !["navigate", "click", "type", "scroll", "wait"].includes(
           event.intended_action?.method,
         ) ||
         event.observed_outcome === "unknown-terminal" ||
@@ -263,7 +263,7 @@ export async function validateTrace({ tracePath }) {
         // differing is a real observed transition, not a self-loop.
         event.before.observation_hash !== event.after.observation_hash ||
         event.before.screenshot_sha256 !== event.after.screenshot_sha256 ||
-        !["observe", "scroll", "click", "type"].includes(
+        !["observe", "scroll", "click", "type", "wait"].includes(
           event.intended_action?.method,
         ))
     )
@@ -371,9 +371,17 @@ const CHANNEL_MARGIN = 14;
 // this much so their vertical legs stay separate.
 const CORRIDOR_SLOT = 26;
 const CORRIDOR_SLOTS = 5;
-// Roughly the shape of a laptop viewport: each lane's grid aims for this width-to-height ratio, so
-// "fit" genuinely fits instead of scaling a single row down to nothing.
-const GRID_ASPECT = 1.7;
+// How many separate channels a band or a gutter will grow to carry. Past this, arrows share a
+// channel: a lane that 12 arrows land on would otherwise open a 300px empty strip above its first
+// card, which is exactly the sprawl that made the long wires long in the first place. Two arrows on
+// one channel rarely overlap -- they run over different stretches of it.
+const BAND_CHANNELS = 4;
+const GUTTER_CHANNELS = 6;
+// Roughly the map surface a laptop offers under the header. The grid's column count is chosen to
+// fill this shape (see gridColumns), so "fit" genuinely fits instead of scaling a mile-long row
+// down to nothing. Only ever an estimate -- the page re-fits to the real window on load.
+const VIEW_WIDTH = 1232;
+const VIEW_HEIGHT = 740;
 // A wire longer than this is not drawn on the resting map at all. At 30+ screens the long wires
 // crossed every lane and no reader could follow one by eye; the source card carries a stub chip
 // naming its target instead, and the wire itself is drawn only while one of its two cards is
@@ -408,6 +416,8 @@ function describeAction(event) {
   if (method === "click") return `Clicked ${target}`;
   if (method === "type") return `Typed into ${target}`;
   if (method === "scroll") return "Scrolled the page";
+  // Time caused this, not a click. The map must never claim an action for what the clock did.
+  if (method === "wait") return "Waited for the screen to change on its own";
   if (method === "navigate") {
     try {
       return `Navigated to ${new URL(event.after?.url ?? event.current_url ?? "").pathname || "/"}`;
@@ -929,37 +939,70 @@ function assignLanes(graph) {
   };
 }
 
-// How many columns a lane's grid gets: the shape closest to GRID_ASPECT, so a lane is about as
-// wide as it is tall rather than a mile-long row.
-function gridColumns(count) {
-  if (count <= 1) return 1;
-  const ideal = Math.sqrt(
-    (count * (NODE_HEIGHT + BAND_MIN) * GRID_ASPECT) / (NODE_WIDTH + COL_GAP),
-  );
-  return Math.max(1, Math.min(count, Math.round(ideal)));
-}
-
-// Lays screens out in stacked lanes, one lane per flow, each lane a boustrophedon grid of cards,
-// and routes every arrow so it never crosses a card or another arrow's label.
+// Lays screens out as lanes -- one lane per flow, each a boustrophedon grid of cards -- packed left
+// to right into rows of lanes, and routes every arrow so it never crosses a card or another arrow's
+// label.
 //
 // Two facts about this layout make honest routing cheap, with no graph-layout library:
-//   * every lane uses the SAME column pitch, so the gap between column N and column N+1 is a
-//     card-free vertical CORRIDOR running the full height of the canvas; and
-//   * the band between two card rows (and the padding above the first row and below the last) is a
-//     card-free horizontal BAND running the full width of its lane.
+//   * every lane's cards sit on the same canvas-wide column grid, so the gap between column N and
+//     column N+1 is a card-free vertical CORRIDOR running the full height of the canvas, whichever
+//     lane happens to be beside which; and
+//   * the space between two card rows inside a lane is a card-free BAND across that lane, and the
+//     space between two rows of lanes is a card-free GUTTER across the whole canvas.
 // So an arrow that is not a step to the neighbouring card leaves its card sideways into the
-// corridor beside it, runs vertically down (or up) that corridor, turns along a channel in the band
-// next to the row it is heading for, and drops into the top (or bottom) of its target. Every leg is
-// in space no card occupies. Bands grow to fit the arrows crossing them, and arrows sharing a
-// corridor are nudged onto separate slots, so arrows do not overlap each other either.
+// corridor beside it and travels only in corridors, bands and gutters until it drops into the top
+// of its target. Every leg is in space no card occupies. Bands and gutters grow to fit the arrows
+// crossing them, and arrows sharing a corridor are nudged onto separate slots, so arrows do not
+// overlap each other either.
+// Every lane sits on the SAME column grid (the routing below depends on that), so how many card
+// columns the canvas gets is one decision for the whole page. Rather than estimate it, lay the
+// whole thing out at every candidate column count and keep the one that fills a laptop-sized window
+// best: the layout is pure arithmetic over a few dozen cards, so trying them all costs nothing, and
+// it is what makes "Fit" fit instead of scaling a mile-long row -- or a mile-long ribbon of one-card
+// lanes -- down to nothing.
 function layoutGraph(graph, lanes) {
-  const { laneOrder, laneTitles, laneOfNode } = lanes;
+  const idsPerLane = lanes.laneOrder.map((laneKey) =>
+    graph.order.filter((id) => lanes.laneOfNode(id) === laneKey),
+  );
+  let best = null;
+  let bestScale = -1;
+  // Up to one column per screen: lanes pack side by side, so the useful column budget is not
+  // capped by the biggest single lane.
+  const mostColumns = Math.max(1, graph.order.length);
+  for (let columns = 1; columns <= mostColumns; columns += 1) {
+    const layout = layoutColumns(graph, lanes, idsPerLane, columns);
+    const scale = Math.min(
+      1,
+      VIEW_WIDTH / layout.canvasWidth,
+      VIEW_HEIGHT / layout.canvasHeight,
+    );
+    if (scale > bestScale) {
+      bestScale = scale;
+      best = layout;
+    }
+  }
+  return best;
+}
+
+function layoutColumns(graph, lanes, idsPerLane, columns) {
+  const { laneOrder, laneTitles } = lanes;
+
   const placement = new Map(); // node id -> { lane, row, col }
   const laneCols = [];
   const laneRows = [];
-  laneOrder.forEach((laneKey, lane) => {
-    const ids = graph.order.filter((id) => laneOfNode(id) === laneKey);
-    const cols = gridColumns(ids.length);
+  const laneColumnStart = [];
+  const laneBandOf = []; // which row of lanes this lane sits in
+  let usedColumns = 0;
+  let laneBand = 0;
+  idsPerLane.forEach((ids, lane) => {
+    const cols = Math.max(1, Math.min(columns, ids.length));
+    if (usedColumns > 0 && usedColumns + cols > columns) {
+      laneBand += 1;
+      usedColumns = 0;
+    }
+    laneColumnStart.push(usedColumns);
+    laneBandOf.push(laneBand);
+    usedColumns += cols;
     laneCols.push(cols);
     laneRows.push(Math.max(1, Math.ceil(ids.length / cols)));
     ids.forEach((id, index) => {
@@ -969,6 +1012,7 @@ function layoutGraph(graph, lanes) {
       placement.set(id, { lane, row, col });
     });
   });
+  const laneBandCount = laneBand + 1;
 
   // Which arrows are a step to the neighbouring card (drawn straight, in the reading direction of
   // their row, or straight down at a row wrap), and which have to be routed. A backward step is
@@ -977,63 +1021,96 @@ function layoutGraph(graph, lanes) {
     const from = placement.get(edge.from);
     const to = placement.get(edge.to);
     if (!from || !to) return null;
-    const sameLane = from.lane === to.lane;
-    if (sameLane && from.row === to.row) {
-      const forward =
-        from.row % 2 === 0 ? to.col === from.col + 1 : to.col === from.col - 1;
-      if (forward) return { kind: "row", from, to };
+    if (from.lane === to.lane) {
+      if (from.row === to.row) {
+        const forward =
+          from.row % 2 === 0
+            ? to.col === from.col + 1
+            : to.col === from.col - 1;
+        if (forward) return { kind: "row", from, to };
+      }
+      if (from.col === to.col && to.row === from.row + 1)
+        return { kind: "wrap", from, to };
+      // The band to use: the one immediately next to the TARGET's row, on the side the arrow
+      // arrives from, so the final vertical leg only ever crosses card-free space.
+      return {
+        kind: "routed",
+        from,
+        to,
+        band: to.row > from.row ? to.row : to.row + 1,
+      };
     }
-    if (sameLane && from.col === to.col && to.row === from.row + 1)
-      return { kind: "wrap", from, to };
-    // The band to use: the one immediately next to the TARGET's row, on the side the arrow arrives
-    // from, so the final vertical leg only ever crosses card-free space.
-    const band =
-      to.lane > from.lane
-        ? 0
-        : to.lane < from.lane
-          ? laneRows[to.lane]
-          : to.row > from.row
-            ? to.row
-            : to.row + 1;
-    return { kind: "routed", from, to, band, cross: !sameLane };
+    // Between lanes: out to a corridor, along the full-width gutter above the target's row of
+    // lanes, down another corridor, and into the top of the target through its own band.
+    return {
+      kind: "cross",
+      from,
+      to,
+      band: to.row,
+      gutter: laneBandOf[to.lane],
+    };
   });
 
   const bandLoad = new Map();
-  for (const plan of plans)
-    if (plan?.kind === "routed") {
-      const key = `${plan.to.lane}:${plan.band}`;
-      bandLoad.set(key, (bandLoad.get(key) ?? 0) + 1);
-    }
+  const gutterLoad = new Map();
+  for (const plan of plans) {
+    if (!plan || plan.kind === "row" || plan.kind === "wrap") continue;
+    const key = `${plan.to.lane}:${plan.band}`;
+    bandLoad.set(key, (bandLoad.get(key) ?? 0) + 1);
+    if (plan.kind === "cross")
+      gutterLoad.set(plan.gutter, (gutterLoad.get(plan.gutter) ?? 0) + 1);
+  }
   const bandHeight = (lane, band) => {
     const load = bandLoad.get(`${lane}:${band}`) ?? 0;
     if (load)
-      return Math.max(BAND_MIN, CHANNEL_MARGIN * 2 + load * CHANNEL_SPACING);
+      return Math.max(
+        BAND_MIN,
+        CHANNEL_MARGIN * 2 + Math.min(load, BAND_CHANNELS) * CHANNEL_SPACING,
+      );
     // An empty band above the first row or below the last is just the lane's own padding; an empty
     // band between two rows still has to carry the wrap arrow and its label.
     return band === 0 || band === laneRows[lane] ? LANE_PADDING : BAND_MIN;
   };
+  const gutterHeight = (gutter) => {
+    const load = gutterLoad.get(gutter) ?? 0;
+    if (load)
+      return Math.max(
+        LANE_GAP,
+        CHANNEL_MARGIN * 2 + Math.min(load, GUTTER_CHANNELS) * CHANNEL_SPACING,
+      );
+    return gutter === 0 ? 0 : LANE_GAP;
+  };
 
-  const laneY = [];
-  const laneHeight = [];
-  const laneWidth = [];
-  laneOrder.forEach((laneKey, lane) => {
+  const laneHeight = laneOrder.map((laneKey, lane) => {
     let height = LANE_HEADER + laneRows[lane] * NODE_HEIGHT;
     for (let band = 0; band <= laneRows[lane]; band += 1)
       height += bandHeight(lane, band);
-    laneHeight.push(height);
-    laneWidth.push(
-      LANE_PADDING * 2 +
-        laneCols[lane] * NODE_WIDTH +
-        (laneCols[lane] - 1) * COL_GAP,
-    );
-    laneY.push(
-      lane === 0
-        ? CANVAS_PADDING
-        : laneY[lane - 1] + laneHeight[lane - 1] + LANE_GAP,
-    );
+    return height;
   });
+  const laneBandHeight = [];
+  for (let band = 0; band < laneBandCount; band += 1)
+    laneBandHeight.push(
+      Math.max(
+        0,
+        ...laneHeight.filter((height, lane) => laneBandOf[lane] === band),
+      ),
+    );
+  const laneBandY = [];
+  for (let band = 0; band < laneBandCount; band += 1)
+    laneBandY.push(
+      band === 0
+        ? CANVAS_PADDING + gutterHeight(0)
+        : laneBandY[band - 1] + laneBandHeight[band - 1] + gutterHeight(band),
+    );
+  const gutterTop = (gutter) =>
+    gutter >= laneBandCount
+      ? laneBandY[laneBandCount - 1] + laneBandHeight[laneBandCount - 1]
+      : laneBandY[gutter] - gutterHeight(gutter);
+  const laneX = (lane) =>
+    CANVAS_PADDING + laneColumnStart[lane] * (NODE_WIDTH + COL_GAP);
+  const laneY = (lane) => laneBandY[laneBandOf[lane]];
   const bandTop = (lane, band) => {
-    let y = laneY[lane] + LANE_HEADER + band * NODE_HEIGHT;
+    let y = laneY(lane) + LANE_HEADER + band * NODE_HEIGHT;
     for (let index = 0; index < band; index += 1) y += bandHeight(lane, index);
     return y;
   };
@@ -1041,15 +1118,18 @@ function layoutGraph(graph, lanes) {
   const positioned = new Map();
   for (const [id, place] of placement)
     positioned.set(id, {
-      x: CANVAS_PADDING + LANE_PADDING + place.col * (NODE_WIDTH + COL_GAP),
+      x: laneX(place.lane) + LANE_PADDING + place.col * (NODE_WIDTH + COL_GAP),
       y: bandTop(place.lane, place.row) + bandHeight(place.lane, place.row),
     });
 
   const regions = laneOrder.map((laneKey, lane) => ({
     title: laneTitles.get(laneKey),
-    x: CANVAS_PADDING,
-    y: laneY[lane],
-    width: laneWidth[lane],
+    x: laneX(lane),
+    y: laneY(lane),
+    width:
+      LANE_PADDING * 2 +
+      laneCols[lane] * NODE_WIDTH +
+      (laneCols[lane] - 1) * COL_GAP,
     height: laneHeight[lane],
   }));
 
@@ -1061,6 +1141,30 @@ function layoutGraph(graph, lanes) {
     map.set(key, slot + 1);
     return slot;
   };
+  // The card-free corridor beside a card, offset onto its own slot so two arrows using the same
+  // corridor do not share a line. Leaving a lane's last column to the right, or its first column to
+  // the left, is still a corridor -- lanes are packed onto the same column grid, so the gap between
+  // any two columns is card-free right across the canvas.
+  const corridor = (x, toTheRight) => {
+    const centre = toTheRight ? x + NODE_WIDTH + COL_GAP / 2 : x - COL_GAP / 2;
+    return (
+      centre +
+      (nextSlot(corridorsUsed, centre) % CORRIDOR_SLOTS) * CORRIDOR_SLOT -
+      ((CORRIDOR_SLOTS - 1) / 2) * CORRIDOR_SLOT
+    );
+  };
+  const legLength = (points) => {
+    let total = 0;
+    for (let index = 1; index < points.length; index += 1)
+      total +=
+        Math.abs(points[index][0] - points[index - 1][0]) +
+        Math.abs(points[index][1] - points[index - 1][1]);
+    return total;
+  };
+  const pathOf = (points) =>
+    points
+      .map((point, index) => `${index ? "L" : "M"} ${point[0]} ${point[1]}`)
+      .join(" ");
 
   const routes = plans.map((plan, index) => {
     const edge = graph.edges[index];
@@ -1101,19 +1205,14 @@ function layoutGraph(graph, lanes) {
       };
     }
     const exitRight = plan.from.col < laneCols[plan.from.lane] - 1;
+    const startX = exitRight ? source.x + NODE_WIDTH : source.x;
     const midY = source.y + NODE_HEIGHT / 2;
-    const corridorCentre = exitRight
-      ? source.x + NODE_WIDTH + COL_GAP / 2
-      : source.x - COL_GAP / 2;
-    const corridorX =
-      corridorCentre +
-      (nextSlot(corridorsUsed, corridorCentre) % CORRIDOR_SLOTS) *
-        CORRIDOR_SLOT -
-      ((CORRIDOR_SLOTS - 1) / 2) * CORRIDOR_SLOT;
+    const corridorA = corridor(source.x, exitRight);
     const channelY =
       bandTop(plan.to.lane, plan.band) +
       CHANNEL_MARGIN +
-      nextSlot(channelsUsed, `${plan.to.lane}:${plan.band}`) * CHANNEL_SPACING;
+      (nextSlot(channelsUsed, `${plan.to.lane}:${plan.band}`) % BAND_CHANNELS) *
+        CHANNEL_SPACING;
     // Arrows landing on the same card come in on separate points along its top (or bottom) edge.
     const entryX =
       target.x +
@@ -1121,23 +1220,50 @@ function layoutGraph(graph, lanes) {
       ((nextSlot(entriesUsed, edge.to) % 3) - 1) * (NODE_WIDTH / 4);
     const enterFromAbove = channelY < target.y;
     const entryY = enterFromAbove ? target.y - 6 : target.y + NODE_HEIGHT + 6;
-    const startX = exitRight ? source.x + NODE_WIDTH : source.x;
-    const length =
-      Math.abs(corridorX - startX) +
-      Math.abs(channelY - midY) +
-      Math.abs(entryX - corridorX) +
-      Math.abs(entryY - channelY);
+    const points =
+      plan.kind === "routed"
+        ? [
+            [startX, midY],
+            [corridorA, midY],
+            [corridorA, channelY],
+            [entryX, channelY],
+            [entryX, entryY],
+          ]
+        : (() => {
+            const gutterY =
+              gutterTop(plan.gutter) +
+              CHANNEL_MARGIN +
+              (nextSlot(channelsUsed, `gutter:${plan.gutter}`) %
+                GUTTER_CHANNELS) *
+                CHANNEL_SPACING;
+            // Reach the target's own lane down a corridor beside its column -- to its left unless
+            // that would fall off the canvas, in which case to its right.
+            const corridorB = corridor(
+              target.x,
+              target.x - COL_GAP < CANVAS_PADDING,
+            );
+            return [
+              [startX, midY],
+              [corridorA, midY],
+              [corridorA, gutterY],
+              [corridorB, gutterY],
+              [corridorB, channelY],
+              [entryX, channelY],
+              [entryX, entryY],
+            ];
+          })();
     return {
-      path: `M ${startX} ${midY} L ${corridorX} ${midY} L ${corridorX} ${channelY} L ${entryX} ${channelY} L ${entryX} ${entryY}`,
-      labelX: (corridorX + entryX) / 2,
+      path: pathOf(points),
+      labelX: (points.at(-2)[0] + entryX) / 2,
       labelY: channelY,
       labelWidth: 420,
       // A routed arrow's label is shown only while one of its cards is focused: eight of them once
       // landed in the same band, stacked on top of each other and unreadable.
       resting: false,
-      cross: plan.cross,
-      long: length > LONG_EDGE,
-      laneTitle: plan.cross ? laneTitles.get(laneOrder[plan.to.lane]) : null,
+      cross: plan.kind === "cross",
+      long: legLength(points) > LONG_EDGE,
+      laneTitle:
+        plan.kind === "cross" ? laneTitles.get(laneOrder[plan.to.lane]) : null,
     };
   });
 
@@ -1145,13 +1271,17 @@ function layoutGraph(graph, lanes) {
     720,
     // One corridor's worth of room past the widest lane, so an arrow leaving the last card in a row
     // still has card-free space to turn in.
+    CANVAS_PADDING * 2 + columns * (NODE_WIDTH + COL_GAP),
     ...regions.map(
       (region) => region.x + region.width + COL_GAP + CANVAS_PADDING,
     ),
   );
   const canvasHeight = Math.max(
     400,
-    ...regions.map((region) => region.y + region.height + CANVAS_PADDING),
+    (laneBandY.at(-1) ?? 0) +
+      (laneBandHeight.at(-1) ?? 0) +
+      gutterHeight(laneBandCount) +
+      CANVAS_PADDING,
   );
   return { regions, positioned, routes, canvasWidth, canvasHeight };
 }
@@ -1242,6 +1372,21 @@ function blockedActionsNote(blockedActions) {
   return `<div class="alert" role="note"><div class="alert-title">${count} request${count === 1 ? "" : "s"} refused by the run's own safety boundary</div><p class="alert-body">Not attempted against the product.</p><details class="alert-list"><summary>Show the refused requests</summary><p>${items}</p></details></div>`;
 }
 
+// A capture's declared circumstances are not observations, but hiding them in a sidecar makes a
+// directed map look like a free walk. Keep this deliberately plain and in the page header.
+function provenanceHeader(provenance) {
+  if (!provenance?.directed_by) return "";
+  const bits = [`Directed: ${escapeHtml(provenance.directed_by)}`];
+  if (provenance.continues) bits.push(`continues ${escapeHtml(provenance.continues)}`);
+  if (provenance.precondition) bits.push(`precondition: ${escapeHtml(provenance.precondition)}`);
+  if (provenance.auth_mode) {
+    const identity = provenance.identity_label ? ` (${escapeHtml(provenance.identity_label)})` : "";
+    bits.push(`sign-in mode: ${escapeHtml(provenance.auth_mode)}${identity}`);
+  }
+  if (provenance.stop?.reason) bits.push(`stop: ${escapeHtml(provenance.stop.reason)}`);
+  return `<div class="provenance-header" title="${escapeHtml(bits.join("; "))}">${bits.join(" · ")}</div>`;
+}
+
 // Renders the interactive atlas: an absolutely-positioned pan/zoom canvas of screenshot cards
 // (model.nodes), SVG arrows labelled in plain language (model.edges), grouped into named lanes
 // (model.regions), with the raw accessibility dump and full evidence detail tucked behind a
@@ -1263,7 +1408,7 @@ function documentHtml(model, meta) {
    overrides it. No framework, no build step, no external font: the page opens from disk. */
 :root{
   color-scheme:light;
-  --background:0 0% 100%;
+  --background:48 28% 97%;
   --foreground:240 10% 3.9%;
   --card:0 0% 100%;
   --card-foreground:240 10% 3.9%;
@@ -1281,13 +1426,13 @@ function documentHtml(model, meta) {
   --destructive-foreground:0 0% 98%;
   --border:240 5.9% 90%;
   --input:240 5.9% 90%;
-  --ring:240 5.9% 10%;
-  --observed:161 84% 26%;
+  --ring:228 80% 53%;
+  --observed:228 75% 49%;
   --claimed:25 90% 42%;
   --unknown:0 72% 45%;
-  --surface:240 5% 97%;
-  --grid:240 6% 88%;
-  --radius:0.5rem;
+  --surface:45 20% 94%;
+  --grid:40 12% 83%;
+  --radius:0.875rem;
   --font:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
   --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   --shadow-sm:0 1px 2px 0 hsl(240 6% 10% / .06);
@@ -1368,6 +1513,7 @@ button,input{font:inherit;color:inherit}
 .brand-name{font-weight:650;letter-spacing:-.01em;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .brand-date{color:hsl(var(--muted-foreground));font-size:12.5px;white-space:nowrap}
 .counts{color:hsl(var(--muted-foreground));font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.provenance-header{color:hsl(var(--muted-foreground));font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .controls{display:flex;align-items:center;gap:8px;margin-left:auto}
 .input{height:32px;width:min(220px,26vw);padding:0 10px;border:1px solid hsl(var(--input));border-radius:calc(var(--radius) - 2px);background:hsl(var(--background));box-shadow:var(--shadow-sm)}
 .input::placeholder{color:hsl(var(--muted-foreground))}
@@ -1414,7 +1560,7 @@ button,input{font:inherit;color:inherit}
 .canvas{position:absolute;transform-origin:0 0;background-image:radial-gradient(hsl(var(--grid)) 1px,transparent 1px);background-size:26px 26px}
 .region{position:absolute;border:1px solid hsl(var(--border));border-radius:calc(var(--radius) + 4px);background:hsl(var(--background) / .55)}
 .region-header{position:absolute;z-index:3;top:0;left:0;right:0;height:${LANE_HEADER}px;display:flex;align-items:center;padding:0 16px}
-.region-header span{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground));border:1px solid hsl(var(--border));border-radius:999px;padding:3px 11px;font-size:12px;font-weight:600;letter-spacing:-.005em;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.region-header span{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground));border:1px solid hsl(var(--border));border-radius:999px;padding:3px 11px;font-size:13.5px;font-weight:600;letter-spacing:-.005em;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .edges{position:absolute;inset:0;overflow:visible;pointer-events:none;z-index:1}
 .edges path{fill:none;stroke:hsl(var(--observed));stroke-width:2.25;stroke-linejoin:round;stroke-linecap:round}
 .edges path.dashed{stroke:hsl(var(--claimed));stroke-dasharray:7 6}
@@ -1477,10 +1623,34 @@ button,input{font:inherit;color:inherit}
 .lightbox-close{position:absolute;top:16px;right:16px;width:34px;height:34px;border:1px solid hsl(0 0% 100% / .3);border-radius:calc(var(--radius) - 2px);background:hsl(0 0% 0% / .4);color:#fff;font-size:18px;line-height:1;cursor:pointer}
 [hidden]{display:none!important}
 @media (max-width:900px){.counts{display:none}}
+/* Narrow screens: let the one header line wrap instead of running off the side. */
+@media (max-width:680px){
+.topbar{flex-wrap:wrap;height:auto;padding:8px 12px;gap:8px}
+.brand{flex:0 0 100%}
+.controls{margin-left:0;flex:1 1 100%;flex-wrap:wrap;gap:6px}
+.input{flex:1 1 120px;width:auto;min-width:0}
+}
+/* Quiet canvas, floating controls and crisp evidence cards. Geometry stays unchanged. */
+.topbar{padding-inline:20px;box-shadow:0 4px 24px hsl(var(--foreground) / .04)}
+.btn{border-radius:8px;font-size:12px;box-shadow:0 1px 2px hsl(var(--foreground) / .04)}
+.btn:hover{border-color:hsl(var(--ring) / .4)}
+.input{border-radius:8px}
+.region{background:hsl(var(--background) / .72);border-color:hsl(var(--border) / .8);box-shadow:inset 0 1px hsl(var(--card) / .8)}
+.region-header span{background:transparent;border:0;border-radius:0;padding:3px 0;font-size:12px;letter-spacing:.035em}
+.region-header span::before{content:"";display:inline-block;width:7px;height:7px;border-radius:2px;background:hsl(var(--observed));margin-right:9px}
+.node{box-shadow:0 2px 4px hsl(var(--foreground) / .04),0 10px 24px -12px hsl(var(--foreground) / .2)}
+.node:hover{box-shadow:0 8px 24px -8px hsl(var(--foreground) / .24);border-color:hsl(var(--observed) / .6)}
+.node.selected{box-shadow:0 0 0 3px hsl(var(--ring) / .3),var(--shadow-md)}
+.meta .title{letter-spacing:-.02em}
+.edges path{stroke-width:2}
+.edge-label{font-weight:500}
+.drawer{padding:24px;box-shadow:-12px 0 48px hsl(var(--foreground) / .08)}
+@media(prefers-reduced-motion:reduce){.node,.drawer,.btn{transition:none}}
 </style></head>
 <body>
 <header class="topbar">
 <div class="brand"><span class="brand-name" title="${escapeHtml(meta.productUrl)}">${escapeHtml(meta.productName)}</span><span class="brand-date">${escapeHtml(meta.runDate)}</span></div>
+${provenanceHeader(meta.provenance)}
 <div class="counts" id="summary"></div>
 <div class="controls">
 <input class="input" id="search" type="search" placeholder="Search screens" aria-label="Search screens">
@@ -1541,7 +1711,7 @@ const root = document.documentElement;
 // available space, not a guess.
 const measureHeader = () => root.style.setProperty('--header-h', document.querySelector('.topbar').getBoundingClientRect().height + 'px');
 measureHeader();
-const NODE_WIDTH = ${NODE_WIDTH}, NODE_HEIGHT = ${NODE_HEIGHT}, FIT_MIN = 0.45;
+const NODE_WIDTH = ${NODE_WIDTH}, NODE_HEIGHT = ${NODE_HEIGHT}, FIT_MIN = 0.2;
 let selectedId = null, scale = 1, tx = 30, ty = 20, drag = null;
 const esc = (value) => String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 // Short, plain-language form of a stop reason for the main map view (the drawer keeps the full text).
@@ -1774,6 +1944,10 @@ export async function renderMap({
   outputPath,
   publicPackPath = null,
   publicPackSha256 = null,
+  // Run id fallback for traces that record no events (observation-only blocked evidence):
+  // map.run_id must still bind the sealed manifest, so memory and report can look it up.
+  // Ignored whenever the trace names its own run.
+  runId = null,
   // Verified-on-screen overrides for a state whose automated on-screen evidence can't honestly
   // title it -- missing entirely, or a known false positive (see deriveNodeTitle above):
   // { [observation_hash]: string[] }. Empty for every ordinary render -- default behavior, and
@@ -1795,6 +1969,12 @@ export async function renderMap({
   // no stop-reason annotation on the final screen.
   let stopInfo = null;
   let findings = [];
+  // Capture mode's label (S-5). Present only when the run was aimed at a goal; a free walk's
+  // explorer-result.json has no such key and map.json gets none either.
+  let directedBy = null;
+  let provenance = {};
+  let claimImageData = null;
+  let goalScreenshots;
   try {
     const raw = await readFile(
       resolve(dirname(tracePath), "explorer-result.json"),
@@ -1805,7 +1985,45 @@ export async function renderMap({
       stopInfo = {
         stopReason: parsed.stop_reason,
         reason: typeof parsed.reason === "string" ? parsed.reason : null,
+        // `goal_reached_at_step` is the historical spelling. Reading it keeps old sealed runs
+        // legible, but it never turns their old `goal_reached` claim into a new verification.
+        step: Number.isInteger(parsed.goal_claimed_at_step)
+          ? parsed.goal_claimed_at_step
+          : (Number.isInteger(parsed.goal_reached_at_step) ? parsed.goal_reached_at_step : null),
       };
+    if (Object.hasOwn(parsed, "goal_screenshots")) goalScreenshots = parsed.goal_screenshots;
+    if (typeof parsed.directed_by === "string" && parsed.directed_by) directedBy = parsed.directed_by;
+    const optionalText = (key) => typeof parsed[key] === "string" && parsed[key] ? parsed[key] : null;
+    provenance = {
+      ...(directedBy ? { directed_by: directedBy } : {}),
+      ...(optionalText("policy") ? { policy: optionalText("policy") } : {}),
+      ...(optionalText("continues") ? { continues: optionalText("continues") } : {}),
+      ...(optionalText("precondition") ? { precondition: optionalText("precondition") } : {}),
+      ...(optionalText("auth_mode") ? { auth_mode: optionalText("auth_mode") } : {}),
+      ...(typeof parsed.identity_label === "string" || parsed.identity_label === null
+        ? { identity_label: parsed.identity_label }
+        : {}),
+    };
+    // The final screen may have been folded into an earlier duplicate card. Keep the separately
+    // claimed file so readers can inspect what the walker actually claimed, never a convenient
+    // substitute. Invalid or missing references remain unavailable.
+    if (typeof parsed.goal_screenshot_path === "string") {
+      const base = await realpath(dirname(tracePath));
+      const declared = resolve(base, parsed.goal_screenshot_path);
+      let claimed = null;
+      try { claimed = await realpath(declared); } catch { /* unavailable claim stays unavailable */ }
+      if (claimed?.startsWith(`${base}/screenshots/`) && claimed !== `${base}/screenshots/`) {
+        try {
+          const bytes = await readFile(claimed);
+          if (bytes.byteLength > 0 && bytes.byteLength <= 16 * 1024 * 1024) {
+            stopInfo = stopInfo ? { ...stopInfo, screenshotPath: parsed.goal_screenshot_path } : stopInfo;
+            claimImageData = `data:${imageMime(claimed)};base64,${bytes.toString("base64")}`;
+          }
+        } catch {
+          // A declaration without its actual retained image is intentionally not substituted.
+        }
+      }
+    }
     // Doors the run chose not to walk through -- an off-site link, a refused action, a wall. They
     // are findings, and map.json carries them so a reader knows what was NOT explored and why.
     if (Array.isArray(parsed.blocked_actions))
@@ -1924,6 +2142,13 @@ export async function renderMap({
     flowCount: countFlows(graph, lanes.laneOfNode),
     canvasWidth: layout.canvasWidth,
     canvasHeight: layout.canvasHeight,
+    provenance: {
+      run_id: events[0]?.run_id ?? runId,
+      ...provenance,
+      ...(goalScreenshots !== undefined ? { goal_screenshots: goalScreenshots } : {}),
+      ...(stopInfo ? { stop: { reason: stopInfo.stopReason, detail: stopInfo.reason, ...(Number.isInteger(stopInfo.step) ? { step: stopInfo.step } : {}), ...(stopInfo.screenshotPath ? { screenshot_path: stopInfo.screenshotPath } : {}) } } : {}),
+      ...(claimImageData ? { claimImageData } : {}),
+    },
   };
   // map.json: the same graph without the drawing. Documented in docs/map-schema.md, and the only
   // thing anyone should have to parse -- map.html is for people, map.json is for programs. It cites
@@ -1950,9 +2175,18 @@ export async function renderMap({
   }));
   const mapJson = {
     schema_version: 1,
-    run_id: events[0]?.run_id ?? null,
+    run_id: events[0]?.run_id ?? runId,
+    // Directed runs only. Its ABSENCE is what says a walk was free, which is why it is spread in
+    // rather than written as null -- `releashed diff` refuses to compare the two kinds.
+    ...(directedBy ? { directed_by: directedBy } : {}),
+    ...(provenance.policy ? { policy: provenance.policy } : {}),
+    ...(provenance.continues ? { continues: provenance.continues } : {}),
+    ...(provenance.precondition ? { precondition: provenance.precondition } : {}),
+    ...(provenance.auth_mode ? { auth_mode: provenance.auth_mode } : {}),
+    ...(Object.hasOwn(provenance, "identity_label") ? { identity_label: provenance.identity_label } : {}),
+    ...(goalScreenshots !== undefined ? { goal_screenshots: goalScreenshots } : {}),
     stop: stopInfo
-      ? { reason: stopInfo.stopReason, detail: stopInfo.reason }
+      ? { reason: stopInfo.stopReason, detail: stopInfo.reason, ...(Number.isInteger(stopInfo.step) ? { step: stopInfo.step } : {}), ...(stopInfo.screenshotPath ? { screenshot_path: stopInfo.screenshotPath } : {}) }
       : null,
     screens,
     transitions,
@@ -1973,6 +2207,7 @@ export async function renderMap({
   const html = documentHtml(model, {
     traceName: basename(tracePath),
     blockedActions,
+    provenance: model.provenance,
     ...runIdentity(events),
   });
   await writeFile(outputPath, html, { encoding: "utf8", mode: 0o600 });
