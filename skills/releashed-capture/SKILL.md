@@ -214,7 +214,8 @@ tools and image viewing. Before authentication, establish this handoff:
 
 If client setup is needed, read only the relevant optional adapter:
 [Muse Code](references/clients/muse.md), [OpenCode](references/clients/opencode.md)
-(including an authorized Muse model), or [Claude CLI](references/clients/claude.md).
+(including an authorized Muse model), [Claude CLI](references/clients/claude.md), or
+[pi](references/clients/pi.md).
 These are version-specific setup notes, not a required choice of caller. Other clients can meet
 the same contract through their own native capabilities. Do not switch caller, model or provider
 implicitly. If a required capability is unavailable, retain and link the actual discovery,

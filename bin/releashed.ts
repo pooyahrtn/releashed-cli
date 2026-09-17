@@ -34,6 +34,13 @@ import { diffMaps, formatDiff, hasDisappearance } from "../lib/map-diff.mjs";
 import { MAX_STEPS } from "../lib/run-limits.mjs";
 import { hasGeminiKey } from "../lib/scaffold.mjs";
 import {
+  BROWSER_REFUSAL,
+  MIN_NODE_MAJOR,
+  missingModelKeys,
+  nodeRefusal,
+  spendNotice,
+} from "../lib/first-run.mjs";
+import {
   assertRunId,
   validateCaptureMetadata,
 } from "../lib/capture-metadata.mjs";
@@ -51,6 +58,10 @@ import { createLocalTiming } from "../lib/local-timing.mjs";
 import { captureDoctor } from "../lib/capture-doctor.mjs";
 import { captureReport } from "../lib/capture-report.ts";
 import { startPhases, stampPhase } from "../lib/capture-phases.ts";
+import {
+  alternativesFromStore,
+  formatAlternatives,
+} from "../lib/goal-alternatives.ts";
 
 type FlagValue = string | true | string[];
 type Flags = Record<string, FlagValue | undefined>;
@@ -104,12 +115,28 @@ const USAGE = `releashed -- an evidence-backed map of a product's user flows, fr
       unverified; check it in the calling client before observe.
 
   releashed map <url> [options]
-      Explore the product and write a map. Needs ANTHROPIC_API_KEY and GEMINI_API_KEY.
+      Explore the product and write a map, driven by OUR model key: needs ANTHROPIC_API_KEY (the
+      explorer) and GEMINI_API_KEY (grounding) by default, plus Chromium from
+      "releashed install-browser" and Node 22 or newer. This is the one command that spends: a
+      40-step run is roughly EUR 0.33 on sonnet or EUR 0.67 on opus, on your key. Screen
+      captions are written by a
+      small Claude on the ANTHROPIC_API_KEY you already have; if GEMINI_API_KEY is set, it
+      captions them instead, exactly as it always did.
+      No key of ours at all: use "releashed explore-mcp" instead (below) -- your own coding agent
+      drives the walk, over MCP, with no Anthropic or Gemini key from this tool.
+      Any key of yours instead of ours: SPIKE_EXPLORER_BASE_URL + SPIKE_EXPLORER_API_KEY route the
+      explorer at any OpenAI-compatible host (Together, OpenRouter, DashScope, ...) instead of
+      Anthropic; CAPTION_BASE_URL + CAPTION_API_KEY (+ optional CAPTION_MODEL) do the same for
+      screen captions instead. Both pairs are all-or-nothing: set the URL and the key
+      together, or leave both unset. See lib/explorer-client.mjs and scripts/caption-screens.mjs
+      for exact behavior.
       --model sonnet|opus  which Claude drives the exploration (default sonnet)
       --steps N            actions the run may take (1-250, default 40; a survey needs ~40, a
                            capture aimed at a screen deep in a long journey needs more)
       --minutes N          wall-clock budget; the run stops when it is spent
-      --budget EUR         model-spend budget; the run stops when it is spent
+      --budget EUR         model-spend cap, e.g. --budget 0.50; the run stops the moment that
+                           much model spend is gone. The run prints its own estimate before
+                           it starts either way
       --login              use the session you saved with "releashed login"
       --auth-cmd <cmd>     a command of YOURS that prints a one-shot sign-in URL, or a session
                            file, for a test account you own -- no browser window, no human
@@ -174,7 +201,8 @@ const USAGE = `releashed -- an evidence-backed map of a product's user flows, fr
 
   releashed mcp [candidate-dir]
       With a candidate, serve that finished map: list_screens, find_screen, get_screen, get_flow,
-      screen_edges, list_transitions. With no candidate, serve shared capture memory: find_capture.
+      screen_edges, list_transitions. With no candidate, serve shared capture memory:
+      find_capture, remember_flow, find_notes.
 
   releashed diff <old-map-dir> <new-map-dir>
       Compare two maps of the same product and say what changed. Prints a one-line summary, then
@@ -1033,12 +1061,53 @@ async function readMapScreenCount(mapDir: string): Promise<number | null> {
   }
 }
 
+// The command-line flag that overrides the thinner-map guard (and is the only way to move the
+// pointer at all for a directed capture). Named once so the returned outcome and the log lines
+// that mention it can never drift apart.
+const FORCE_MAP_POINTER_FLAG = "--force-map-pointer";
+
+// What a call to writeAgentsBlock actually decided, in a shape a caller can branch on without
+// parsing prose. `moved` is the one fact that matters most; everything else is why, and what the
+// file said before and after.
+export type PointerOutcome = {
+  moved: boolean;
+  // Why the pointer was left alone. Null when it moved, or when there was nothing to compare
+  // (first-ever write, or no instruction file to hold it at all).
+  reason: "directed-capture" | "thinner-map" | null;
+  // The instruction file this decision concerns -- null when this run's map does not live inside
+  // `directory` at all, so no file was even considered.
+  path: string | null;
+  // The resolved map directory the instruction file points at once this call returns. Null when
+  // no pointer exists there (nothing written yet, or `path` itself is null).
+  pointsAt: string | null;
+  // The resolved directory of the candidate this call was about, whether or not it won.
+  candidateDir: string;
+  screens: number | null;
+  previousScreens: number | null;
+  override: typeof FORCE_MAP_POINTER_FLAG;
+};
+
 export async function writeAgentsBlock(
   candidateDir: string,
   directory = process.cwd(),
   log = console.log,
-  { force = false }: { force?: boolean } = {},
-) {
+  {
+    force = false,
+    dryRun = false,
+    reason = null,
+  }: {
+    force?: boolean;
+    // A dry run computes and returns the same outcome a real call would, but never writes the
+    // file and never logs on its own -- the caller already knows why (it decided not to call this
+    // for real) and says so in its own words. Used for a directed capture without
+    // --force-map-pointer, which must never touch the pointer but still owes the coding agent a
+    // legible reason, not just a missing side effect.
+    dryRun?: boolean;
+    reason?: "directed-capture" | null;
+  } = {},
+): Promise<PointerOutcome> {
+  const resolvedCandidateDir = resolve(candidateDir);
+  const newScreens = await readMapScreenCount(resolvedCandidateDir);
   // Only a project that will HOLD the map gets its instructions edited. Run from somewhere else --
   // a scratch folder, somebody else's repo -- and we print the block instead of writing a pointer
   // into a file that has nothing to do with this run. (Dogfood night, 2026-09-06: a run launched
@@ -1053,7 +1122,6 @@ export async function writeAgentsBlock(
     // Embed the map's location relative to the instruction file that names it, not as an absolute
     // path -- an absolute path only works on the machine and worktree that wrote it, and breaks for
     // every other clone, worktree or person reading the same AGENTS.md/CLAUDE.md.
-    const resolvedCandidateDir = resolve(candidateDir);
     const relativeCandidateDir = relative(dirname(path), resolvedCandidateDir);
     const block = agentsBlock(relativeCandidateDir);
     if (existing.includes(BLOCK_MARK)) {
@@ -1069,7 +1137,17 @@ export async function writeAgentsBlock(
       const oldScreens = oldCandidateDir
         ? await readMapScreenCount(oldCandidateDir)
         : null;
-      const newScreens = await readMapScreenCount(resolvedCandidateDir);
+      if (dryRun)
+        return {
+          moved: false,
+          reason,
+          path,
+          pointsAt: oldCandidateDir,
+          candidateDir: resolvedCandidateDir,
+          screens: newScreens,
+          previousScreens: oldScreens,
+          override: FORCE_MAP_POINTER_FLAG,
+        };
       if (
         !force &&
         oldCandidateDir &&
@@ -1079,9 +1157,18 @@ export async function writeAgentsBlock(
       ) {
         log(
           `left ${name} alone: the new map at ${resolvedCandidateDir} has ${newScreens} screen(s), fewer than the ${oldScreens} screen(s) in the map it already points to, ${oldCandidateDir}. ` +
-            `If the new map is the one you want, pass --force-map-pointer.`,
+            `If the new map is the one you want, pass ${FORCE_MAP_POINTER_FLAG}.`,
         );
-        return path;
+        return {
+          moved: false,
+          reason: "thinner-map",
+          path,
+          pointsAt: oldCandidateDir,
+          candidateDir: resolvedCandidateDir,
+          screens: newScreens,
+          previousScreens: oldScreens,
+          override: FORCE_MAP_POINTER_FLAG,
+        };
       }
       await writeFile(path, `${before}${block}${after ?? ""}`);
       if (oldCandidateDir && oldCandidateDir !== resolvedCandidateDir) {
@@ -1091,14 +1178,56 @@ export async function writeAgentsBlock(
           `map pointer in ${name} moved from ${oldCandidateDir} (${describe(oldScreens)}) to ${resolvedCandidateDir} (${describe(newScreens)})`,
         );
       }
-    } else await writeFile(path, `${existing.trimEnd()}\n\n${block}\n`);
+      log(`told ${name} to ask the map first`);
+      return {
+        moved: true,
+        reason: null,
+        path,
+        pointsAt: resolvedCandidateDir,
+        candidateDir: resolvedCandidateDir,
+        screens: newScreens,
+        previousScreens: oldScreens,
+        override: FORCE_MAP_POINTER_FLAG,
+      };
+    }
+    if (dryRun)
+      return {
+        moved: false,
+        reason,
+        path,
+        pointsAt: null,
+        candidateDir: resolvedCandidateDir,
+        screens: newScreens,
+        previousScreens: null,
+        override: FORCE_MAP_POINTER_FLAG,
+      };
+    await writeFile(path, `${existing.trimEnd()}\n\n${block}\n`);
     log(`told ${name} to ask the map first`);
-    return path;
+    return {
+      moved: true,
+      reason: null,
+      path,
+      pointsAt: resolvedCandidateDir,
+      candidateDir: resolvedCandidateDir,
+      screens: newScreens,
+      previousScreens: null,
+      override: FORCE_MAP_POINTER_FLAG,
+    };
   }
-  log(
-    `\nadd this to your AGENTS.md or CLAUDE.md so your agent asks the map first:\n\n${agentsBlock(resolve(candidateDir))}\n`,
-  );
-  return null;
+  if (!dryRun)
+    log(
+      `\nadd this to your AGENTS.md or CLAUDE.md so your agent asks the map first:\n\n${agentsBlock(resolve(candidateDir))}\n`,
+    );
+  return {
+    moved: false,
+    reason,
+    path: null,
+    pointsAt: null,
+    candidateDir: resolvedCandidateDir,
+    screens: newScreens,
+    previousScreens: null,
+    override: FORCE_MAP_POINTER_FLAG,
+  };
 }
 
 // A capture's result belongs to the sealed map, not to a hopeful reading of the explorer's log.
@@ -1110,6 +1239,7 @@ export function captureHandoff(
 ) {
   if (stop?.reason === "goal_claimed" || stop?.reason === "goal_reached")
     return {
+      reached: true,
       stripHeading: `Goal claimed (not verified): ${goal}`,
       lines: [
         "capture result: goal claimed by the explorer (not verified); inspect the retained evidence before relying on it.",
@@ -1129,6 +1259,7 @@ export function captureHandoff(
     "observation_error",
     "run_error",
     "executor_could_not_locate_target",
+    "executor_locator_error",
     "off_site_navigation_unrecoverable",
   ]);
   const lines = [
@@ -1154,7 +1285,10 @@ export function captureHandoff(
       `If that prior state is verified, --continues ${runId} records the relation only: it does not replay a browser or any action.`,
     );
   }
+  // Said out loud so the caller does not have to re-derive it from the reason string. A run that
+  // fell short owes the asker more than a stop code: see lib/goal-alternatives.ts.
   return {
+    reached: false,
     stripHeading: `Partial evidence — goal not confirmed: ${goal}`,
     lines,
   };
@@ -1242,7 +1376,7 @@ export async function mapCommand(options: MapOptions, deps: MapDeps = {}) {
   // Somebody else's product gets the strict defaults, and the run says so out loud rather than
   // leaving the user to assume it. --mine widens what the run may DO (send, post, submit, reply --
   // ordinary product use) but never what it may spend or destroy: pay, delete, billing, checkout,
-  // subscribe and account destruction stay refused either way. See docs/CONTROL-SURFACE.md.
+  // subscribe and account destruction stay refused either way. See docs/ARCHITECTURE.md.
   if (!options.mine)
     log(
       `${new URL(options.url).origin} is not marked as yours (--mine): this run is read-only, never signs in, never sends, posts, pays or deletes, and redacts contact details out of the evidence.`,
@@ -1251,6 +1385,11 @@ export async function mapCommand(options: MapOptions, deps: MapDeps = {}) {
     log(
       `${new URL(options.url).origin} is marked as yours (--mine): this run may use the product like a user (send, post, submit, reply), but never pays, deletes, or touches billing, checkout, subscriptions or account destruction.`,
     );
+
+  // What this is about to cost, before the landing page is read and before --login opens a browser
+  // and waits for a human. A first run used to learn the price only from the README, or afterwards
+  // from metrics.json, and --budget was discoverable only by reading the whole usage text.
+  log(spendNotice(options.steps, options.model, options.budgetEur));
 
   // 1. What the product says about itself, quoted verbatim from its own landing page. Plain code,
   //    no model call, and no journeys -- the explorer never sees any of it.
@@ -1404,18 +1543,82 @@ export async function mapCommand(options: MapOptions, deps: MapDeps = {}) {
   // guard alone would have let it through. So a directed run never repoints the project's
   // instructions on its own; --force-map-pointer, which already overrides the screen-count guard,
   // is the one deliberate way to point them at a capture anyway.
+  let pointer: PointerOutcome;
   if (options.goal && !options.forceMapPointer) {
     log(
       `directed capture: left AGENTS.md/CLAUDE.md's map pointer untouched -- a run aimed at "${options.goal}" is labelled as directed, not a survey, and is not evidence of what the product discoverably has. Serve this capture directly with releashed mcp ${result.output_path}, or pass --force-map-pointer to point the project's instructions at it anyway.`,
     );
+    // A directed capture never touches the pointer on its own, but the coding agent reading this
+    // result still needs a machine-readable reason and the file/directories involved -- not just
+    // the prose line above. A dry run gets that for free from the same lookup writeAgentsBlock
+    // would otherwise do, without writing anything.
+    pointer = await agents(result.output_path, process.cwd(), log, {
+      dryRun: true,
+      reason: "directed-capture",
+    });
   } else {
-    await agents(result.output_path, process.cwd(), log, {
+    pointer = await agents(result.output_path, process.cwd(), log, {
       force: options.forceMapPointer,
     });
   }
   for (const line of handoff?.lines ?? []) log(line);
+  // A run that fell short still owes the asker an answer. On 2026-09-17 a capture spent its whole
+  // budget failing to find "a theory lesson", and the screen it wanted was already sealed on disk
+  // from a run six minutes earlier -- nothing looked. So before handing back a stop code, search
+  // what has already been captured using the asker's own words and name the candidates, with their
+  // dates, because staleness is the caller's judgment. This never asserts the product LACKS
+  // anything: that exact conclusion would have been false that morning.
+  const alternatives =
+    options.goal && handoff && !handoff.reached
+      ? await alternativesFromStore({
+          mapsRoot: join(out, "maps"),
+          goal: options.goal,
+          origin: new URL(options.url).origin,
+          excludeRunId: runId,
+        })
+      : null;
+  if (alternatives) for (const line of formatAlternatives(alternatives)) log(line);
   log(`serve it to your agent with:  releashed mcp ${result.output_path}`);
-  return { candidateDir: result.output_path, mapPath };
+  // `alternatives` rides back with `pointer`: a calling agent gets the candidates as data, not
+  // only as the prose printed above.
+  return { candidateDir: result.output_path, mapPath, pointer, alternatives };
+}
+
+// Everything a `map` run needs, checked before it reads the product, writes a file, opens a login
+// browser or spends a cent. Free and offline: no model call, no network, no browser launch.
+//
+// It reports every problem at once rather than the first one. Before 2026-09-17 a reader with a
+// fresh machine met these one at a time, each as a stack trace out of a child process: no explorer
+// key, fix it, re-run, no grounding key, fix it, re-run, no Chromium. Three refusals for one setup,
+// and the Chromium one was answered by Playwright's own banner naming the wrong install command.
+export async function mapPreflight(
+  deps: {
+    env?: Record<string, string | undefined>;
+    nodeVersion?: string;
+    browser?: () => Promise<void>;
+    // `login` opens a browser but calls no model, so it checks everything except the keys.
+    keys?: boolean;
+  } = {},
+): Promise<string[]> {
+  const {
+    env = process.env,
+    keys = true,
+    nodeVersion = process.versions.node,
+    browser = async () => {
+      const { chromium } = await import("playwright");
+      await access(chromium.executablePath());
+    },
+  } = deps;
+  const problems: string[] = [];
+  const outdatedNode = nodeRefusal(nodeVersion);
+  if (outdatedNode) problems.push(outdatedNode);
+  if (keys) problems.push(...missingModelKeys(env));
+  try {
+    await browser();
+  } catch {
+    problems.push(BROWSER_REFUSAL);
+  }
+  return problems;
 }
 
 // One tiny model call, because a run that dies on an empty balance wastes a browser and an evening.
@@ -1459,12 +1662,12 @@ export async function doctor(deps: DoctorDeps = {}) {
   };
   log("releashed doctor");
   await check(
-    "node 22 or newer",
+    `node ${MIN_NODE_MAJOR} or newer`,
     () => {
-      if (Number(process.versions.node.split(".")[0]) < 22)
+      if (Number(process.versions.node.split(".")[0]) < MIN_NODE_MAJOR)
         throw new Error(`this is node ${process.versions.node}`);
     },
-    "install node 22+",
+    `install node ${MIN_NODE_MAJOR}+ from https://nodejs.org/en/download, or run: nvm install ${MIN_NODE_MAJOR} && nvm use ${MIN_NODE_MAJOR}`,
   );
   await check(
     "ANTHROPIC_API_KEY works and has credit",
@@ -1472,25 +1675,38 @@ export async function doctor(deps: DoctorDeps = {}) {
       if (!process.env.ANTHROPIC_API_KEY) throw new Error("not set");
       await ask(process.env.ANTHROPIC_API_KEY);
     },
-    "set a key from console.anthropic.com with a positive balance; a 400 about credit means the balance is empty",
+    "get a key at https://console.anthropic.com/settings/keys with a positive balance and export ANTHROPIC_API_KEY; a 400 about credit means the balance is empty -- or set SPIKE_EXPLORER_BASE_URL with SPIKE_EXPLORER_API_KEY for an OpenAI-compatible host, or skip our keys entirely with: releashed explore-mcp",
   );
   await check(
-    "GEMINI_API_KEY works (points at controls, until the Claude grounder lands)",
+    // No "until the Claude grounder lands" any more. Claude points accurately enough (8 of 8
+    // controls inside the real element, artifacts/grounding-probe-claude-20260905), but it did so
+    // through a direct Anthropic call; the browser-automation library we ground through accepts
+    // only its own listed model families and none of them is Anthropic's. Naming the real blocker
+    // beats implying a swap is imminent. See resolveGroundingEnv in scripts/vision-explorer-run.mjs.
+    "GEMINI_API_KEY works (points at controls; Midscene has no Anthropic grounding family)",
     async () => {
       if (!hasGeminiKey()) throw new Error("not set");
       await ground(process.env.GEMINI_API_KEY!);
     },
-    "set a key from aistudio.google.com",
+    "get a free key at https://aistudio.google.com/apikey -- or set MIDSCENE_MODEL_API_KEY with MIDSCENE_MODEL_NAME/_FAMILY/_BASE_URL for another grounder, or skip our keys entirely with: releashed explore-mcp",
   );
   await check(
     "chromium installed",
     browser,
-    "run: npx playwright install chromium",
+    // Not `npx playwright install chromium`: that fetches whatever Playwright the registry serves
+    // today, whose browser revision may not be the one this package is pinned to, so the check can
+    // go green while `map` still cannot launch. install-browser uses this package's own Playwright.
+    "run: releashed install-browser",
   );
   const failed = checks.filter((entry) => !entry.ok);
   log(
     failed.length === 0
-      ? "\nall good -- try: releashed map https://example.com"
+      ? `\nall good -- try: releashed map https://example.com\n${spendNotice(
+          40,
+          "sonnet",
+          null,
+          "that default 40-step run",
+        )}`
       : `\n${failed.length} problem(s) to fix first`,
   );
   return checks;
@@ -1665,10 +1881,24 @@ export async function main(argv = process.argv.slice(2)) {
     return;
   }
   if (options.command === "map") {
+    const problems = await mapPreflight();
+    if (problems.length)
+      throw new Error(
+        `releashed map cannot start. ${problems.length} thing${
+          problems.length === 1 ? "" : "s"
+        } to fix first:\n\n${problems.join(
+          "\n\n",
+        )}\n\nConfirm the fix, including whether the keys have credit, with: releashed doctor`,
+      );
     await mapCommand(options);
     return;
   }
   if (options.command === "login") {
+    // login is the first command in the README and the only one before map that opens a browser, so
+    // it owes the same named answer rather than Playwright's own banner. No key check here: signing
+    // in yourself needs no model at all.
+    const problems = await mapPreflight({ keys: false });
+    if (problems.length) throw new Error(problems.join("\n\n"));
     const path = await captureLogin(
       options.url,
       join(outputRoot(), "sessions"),

@@ -85,7 +85,7 @@ remain candidates for visual inspection, not verified coverage.
 
 The retained session-review run is the regression: its old stop points at `state-0045.png`,
 while a separate selection can name `state-0039.png` through `state-0043.png` without changing
-any sealed bytes. Full record: [capture acceptance](capture-acceptance-2026-09.md#ordinary-developer-variant--2026-09-07).
+any sealed bytes. Full record: [acceptance.md](acceptance.md).
 
 ## What is deliberately absent
 

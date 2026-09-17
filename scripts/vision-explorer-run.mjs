@@ -32,6 +32,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { MODEL_FAMILY_VALUES } from "@midscene/shared/env";
 import {
   budgetExhausted,
   checkActionAuthorized,
@@ -57,6 +58,7 @@ import { PlaywrightAgent } from "@midscene/web/playwright";
 import { chromium } from "playwright";
 import { explorerModel } from "../lib/explorer-client.mjs";
 import { isAuthFlowUrl, modelCostEur, priceSourceFor, sha256Text } from "../lib/scaffold.mjs";
+import { EXPLORER_KEY_REFUSAL, GROUNDING_KEY_REFUSAL } from "../lib/first-run.mjs";
 import { assertRunId, validateCaptureMetadata } from "../lib/capture-metadata.mjs";
 // Same rule the MCP finish route enforces (lib/explore-mcp.mjs): a goal claim may only cite a
 // screenshot the recorded trace retains, and that file must be re-read and match its recorded
@@ -84,6 +86,74 @@ const scrub = (text) =>
   String(text)
     .replace(/\/(?:Users|home|private|var)\/[^\s"']+/g, "<path>")
     .slice(0, 200);
+
+// A bad MIDSCENE_MODEL_FAMILY does not fail the run that sets it: Midscene rejects it on every
+// aiLocate/aiTap/aiInput call the same way, which this loop's own retry/no-effect logic then reads
+// as three steps that could not find their target on screen -- and seals
+// executor_could_not_locate_target, blaming the product's UI for a config mistake on the caller's
+// machine. Check the installed package's OWN accepted values before the walk starts, so this is a
+// crisp failure at step zero instead of a misleading one three steps in.
+export function validateLocatorModelFamily(family) {
+  if (!MODEL_FAMILY_VALUES.includes(family))
+    throw new Error(
+      `MIDSCENE_MODEL_FAMILY "${family}" is not one of the families the installed Midscene ` +
+        `package accepts: ${MODEL_FAMILY_VALUES.join(", ")}. Fix it before running -- an invalid ` +
+        `family fails every locate call identically and, left uncaught, reads as "nothing on ` +
+        `screen matched" rather than as the configuration mistake it is.`,
+    );
+}
+
+// Which model points at the control the explorer names, and on whose key. Pure: a function of the
+// environment alone, so the whole selection -- including the refusal -- is testable without a
+// browser, a network call or a key.
+//
+// gemini-3.6-flash is the grounding model scripts/grounding-offset-probe.mjs validated against a
+// real app's DOM boxes. Do not swap the default without re-running that probe: a grounder that is
+// confidently 50px off clicks the neighbouring control and every success signal still reads green.
+//
+// Each of the four settings is filled independently, exactly as the `??=` sequence this replaced
+// did, so every explicit override a caller already sets keeps working untouched -- including a key
+// alone (MIDSCENE_MODEL_API_KEY with the Gemini default) and a whole foreign provider (all four).
+//
+// ANTHROPIC_API_KEY is deliberately NOT a fallback here. Claude can point accurately -- the probe in
+// artifacts/grounding-probe-claude-20260905 put 8 of 8 controls inside the real element -- but it
+// pointed through a direct Anthropic call, not through Midscene, and the installed Midscene package
+// grounds only through the families it lists (MODEL_FAMILY_VALUES), none of which is Anthropic's.
+// Quietly aiming the Anthropic key at a family that is not Anthropic's would fail every locate call
+// identically, which is precisely the misleading failure validateLocatorModelFamily above exists to
+// prevent. Refusing here, by name, is the honest version.
+// The words themselves now live in lib/first-run.mjs, with the explorer-key refusal beside them, so
+// `releashed map` can say either one before the walk starts without importing this file (and
+// Playwright, and Midscene) to do it. Re-exported here because this is where callers already look.
+export { GROUNDING_KEY_REFUSAL };
+
+export function resolveGroundingEnv(env) {
+  const resolved = {
+    MIDSCENE_MODEL_NAME: env.MIDSCENE_MODEL_NAME ?? "gemini-3.6-flash",
+    MIDSCENE_MODEL_FAMILY: env.MIDSCENE_MODEL_FAMILY ?? "gemini",
+    MIDSCENE_MODEL_BASE_URL:
+      env.MIDSCENE_MODEL_BASE_URL ?? "https://generativelanguage.googleapis.com/v1beta/openai/",
+    MIDSCENE_MODEL_API_KEY: env.MIDSCENE_MODEL_API_KEY ?? env.GEMINI_API_KEY,
+  };
+  if (!resolved.MIDSCENE_MODEL_API_KEY) throw new Error(GROUNDING_KEY_REFUSAL);
+  return resolved;
+}
+
+// Distinguishes a genuine "nothing on screen matched" miss from the locator itself being
+// misconfigured or failing (a rejected model family, a bad API key, a network or timeout error
+// reaching the grounding provider). Conflating the two seals a config problem as a product-UI
+// finding -- exactly the misleading self-report this loop exists to avoid.
+// "Element not found" is Midscene's own stable phrasing for a genuine miss (thrown by aiTap,
+// aiInput, aiScroll and DragAndDrop when nothing grounds); the raw aiLocate() path this loop uses
+// for a tap decision instead returns an empty center, which this file's own destructuring then
+// throws reading .x/.y/.center of undefined -- also a genuine miss, not a locator failure.
+// Anything else thrown is the locator itself, not the screen.
+export function classifyExecutorFailure(message) {
+  const text = String(message ?? "");
+  if (/Element not found/.test(text)) return "miss";
+  if (/Cannot read propert(?:y|ies) of undefined \(reading '(?:x|y|center)'\)/.test(text)) return "miss";
+  return "locator_error";
+}
 
 // The target ORIGIN is read from SPIKE_APP_URL, not a flag: the imported signIn (used by clerk-mode
 // auth) closes over the spike module's own copy of that variable, so a flag here could silently
@@ -683,20 +753,17 @@ async function main() {
   // Either key, never both: SPIKE_EXPLORER_BASE_URL routes the explorer at an OpenAI-compatible
   // host instead of Anthropic (lib/explorer-client.mjs).
   if (!process.env.SPIKE_EXPLORER_BASE_URL && !process.env.ANTHROPIC_API_KEY)
-    throw new Error("ANTHROPIC_API_KEY is required (or SPIKE_EXPLORER_BASE_URL for an OpenAI-compatible host)");
-  // gemini-3.6-flash is the grounding model scripts/grounding-offset-probe.mjs validated against
-  // this app's real DOM boxes. Do not swap it without re-running that probe: a grounder that is
-  // confidently 50px off clicks the neighbouring control and every success signal still reads green.
-  process.env.MIDSCENE_MODEL_NAME ??= "gemini-3.6-flash";
-  process.env.MIDSCENE_MODEL_FAMILY ??= "gemini";
-  process.env.MIDSCENE_MODEL_BASE_URL ??=
-    "https://generativelanguage.googleapis.com/v1beta/openai/";
-  process.env.MIDSCENE_MODEL_API_KEY ??= process.env.GEMINI_API_KEY;
+    throw new Error(EXPLORER_KEY_REFUSAL);
+  // Who points at the controls, and on whose key -- see resolveGroundingEnv above. It refuses by
+  // name when there is no grounding key at all, before the browser launches or an identity is
+  // minted, rather than three steps into a walk that cannot locate anything.
+  Object.assign(process.env, resolveGroundingEnv(process.env));
   // Midscene writes its own report folder to the CURRENT directory unless told otherwise, which
   // litters whatever repo the run was launched from. Keep it beside the run's own output.
   process.env.MIDSCENE_RUN_DIR ??= join(process.env.RELEASHED_OUT ?? join(process.cwd(), "releashed"), "midscene");
-  if (!process.env.MIDSCENE_MODEL_API_KEY)
-    throw new Error("GEMINI_API_KEY is required for grounding");
+  // Fail fast on a locator misconfiguration before the walk starts (see validateLocatorModelFamily
+  // above) rather than three steps and a misleading "could not locate" seal into it.
+  validateLocatorModelFamily(process.env.MIDSCENE_MODEL_FAMILY);
 
   const runId = `vision-${new URL(app).protocol === "https:" ? "prod" : "local"}-${new Date()
     .toISOString()
@@ -735,6 +802,10 @@ async function main() {
   // at 32, Val Town at 60. This is the counter the message always described -- reset by any step
   // that actually dispatched.
   let consecutiveUnexecutable = 0;
+  // Kinds behind the same streak (see classifyExecutorFailure), reset in lockstep with the counter
+  // above: whether the breaker below reports "nothing on screen matched" or "the locator itself is
+  // failing" depends on what actually happened in that streak, not a guess.
+  let unexecutableKinds = [];
   // The two counters behind the breaker and the wait budget: how many steps in a row have changed
   // nothing on screen, and how much of the run's total waiting time is already spent.
   let consecutiveNoEffect = 0;
@@ -1022,20 +1093,32 @@ async function main() {
           // The executor refused to guess a coordinate, so no input was dispatched. There is no
           // observed transition to record -- an attempted instruction is not evidence.
           const message = scrub(error?.message ?? error);
+          const kind = classifyExecutorFailure(error?.message ?? error);
           unexecutable.push({ instruction: decision.instruction, target: decision.target, message });
           consecutiveUnexecutable += 1;
+          unexecutableKinds.push(kind);
           history.push(
-            `(the previous instruction could not be carried out: nothing on screen matched "${decision.target}")`,
+            kind === "locator_error"
+              ? `(the previous instruction could not be carried out: the configured locator itself failed, not the product's screen: ${message})`
+              : `(the previous instruction could not be carried out: nothing on screen matched "${decision.target}")`,
           );
           console.log(`    NOT EXECUTED: ${message}`);
           if (consecutiveUnexecutable >= 3) {
-            stopReason = "executor_could_not_locate_target";
-            stopDetail = `Exploration stopped after three instructions in a row that nothing on screen matched, the last being "${decision.instruction}".`;
+            // Only call it a genuine miss if at least one failure in the streak actually was one;
+            // a streak that is ENTIRELY locator failures is the locator, not the product's screen.
+            if (unexecutableKinds.every((k) => k === "locator_error")) {
+              stopReason = "executor_locator_error";
+              stopDetail = `Exploration stopped after three instructions in a row where the configured locator itself failed (not "nothing on screen matched") -- check MIDSCENE_MODEL_BASE_URL/_NAME/_FAMILY and its API key. Last error: ${message}`;
+            } else {
+              stopReason = "executor_could_not_locate_target";
+              stopDetail = `Exploration stopped after three instructions in a row that nothing on screen matched, the last being "${decision.instruction}".`;
+            }
             break;
           }
           continue;
         }
         consecutiveUnexecutable = 0;
+        unexecutableKinds = [];
         await page.waitForTimeout(1_500);
       }
 
@@ -1260,7 +1343,7 @@ async function main() {
           installed: "raw CDP Fetch.requestPaused, attached before the executor",
           // Honest labeling of what this run was allowed to do to its own origin: "owner" when
           // --mine was set (or the target is fully trusted, e.g. the built-in APPROVED_TARGETS
-          // path, readOnly: false), "stranger" otherwise -- see docs/CONTROL-SURFACE.md.
+          // path, readOnly: false), "stranger" otherwise -- see docs/ARCHITECTURE.md.
           mode: target.mine || !target.readOnly ? "owner" : "stranger",
           one_way_probe: boundary.probe ?? null,
           refused: boundary.refused.map((item) => ({ method: item.method, reason: item.reason })),

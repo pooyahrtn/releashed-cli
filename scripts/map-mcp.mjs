@@ -3,9 +3,9 @@
 //
 //   node scripts/map-mcp.mjs artifacts/<candidate-dir>
 //
-// Three tools and nothing else: list_screens, get_screen, list_transitions. This is the W1-7
-// benchmark's third condition -- the agent gets the map instead of a browser -- not the
-// observe/act/record server option D sketches in the project's own architecture notes.
+// Six read-only tools and nothing else: list_screens, find_screen, get_screen, screen_edges,
+// get_flow, list_transitions. The agent gets the map instead of a browser; this is not the
+// observe/act/record explore server (lib/explore-mcp.mjs).
 //
 // The map is read from the candidate's own map.html, which already embeds the rendered graph as
 // `const model = {...}` (nodes with title/caption/url/imageData, edges with the action label). That

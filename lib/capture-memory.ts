@@ -78,7 +78,10 @@ function matchingScore(map: CaptureMap, goal: string) {
 
 // Request framing is not screen content. Keep product terms (including Today) and
 // match whole tokens, so "me" cannot match "timer" or a newer unrelated frame.
-const observationRequestWords = new Set(
+// Exported because a second caller needs exactly this distinction: lib/goal-alternatives.ts
+// scores one run's goal against another's, and the framing a human wraps a request in ("show
+// me the screen that") is noise on both sides. One definition, so the two can never drift.
+export const REQUEST_FRAMING_WORDS = new Set(
   "a an the me my we our you your it its this that these those of for from in on at to and or with please show see find give current currently latest flow flows screen screens screenshot screenshots image images".split(
     " ",
   ),
@@ -109,7 +112,7 @@ function scoredObservations(
   goalPaths: Set<string>,
 ): { scored: ScoredObservation[]; of_terms: number } {
   const wanted = [...new Set(terms(goal))].filter(
-    (term) => !observationRequestWords.has(term),
+    (term) => !REQUEST_FRAMING_WORDS.has(term),
   );
   const empty = { scored: [] as ScoredObservation[], of_terms: wanted.length };
   if (wanted.length === 0) return empty;
@@ -297,6 +300,26 @@ async function candidate(
   const claimBytes = screenshot
     ? await sealedFile(candidateDir, manifest, screenshot)
     : null;
+  // What that image is a picture OF, in the product's own words. A lookup that answers with a
+  // path and a date, but cannot say "that is the KNM chapter reading page", makes the caller
+  // open a PNG to find out whether it is worth opening. The screen record is already parsed and
+  // sealed-verified here, so this costs nothing and invents nothing: it is the map's own title
+  // and url for the very screenshot named above, or null when no screen claims that file.
+  const claimedScreenRecord = screenshot
+    ? (map.screens ?? []).find((entry) => entry?.screenshot === screenshot)
+    : undefined;
+  const claimed_screen = claimedScreenRecord
+    ? {
+        title:
+          typeof claimedScreenRecord.title === "string"
+            ? claimedScreenRecord.title.slice(0, 200)
+            : null,
+        url:
+          typeof claimedScreenRecord.url === "string"
+            ? claimedScreenRecord.url.slice(0, 500)
+            : null,
+      }
+    : null;
   const exact = normal(map.directed_by) === normal(goal);
   const score = matchingScore(map, goal);
   const goalPaths = new Set(
@@ -407,6 +430,7 @@ async function candidate(
     of_terms: terms(goal).length,
     status: claimed ? "claimed_candidate" : "partial_evidence",
     screenshot_path: claimed ? resolve(candidateDir, screenshot!) : null,
+    claimed_screen,
     goal_screenshots: goalScreenshots,
     matching_observations,
     observation_matched_terms,

@@ -1,8 +1,0 @@
-.DS_Store
-.env
-.env.*
-!.env.example
-node_modules/
-
-# the CLI writes runs, packs and saved sessions under ./releashed when RELEASHED_OUT is unset
-releashed/

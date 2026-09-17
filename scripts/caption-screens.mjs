@@ -12,11 +12,11 @@
 // only ever said by an arrow (see usableCaption in renderer/render-map.mjs, which also refuses a
 // caption that tries to claim an effect).
 //
-// A small, cheap vision model does the captioning -- the same grounding family the explorer already
-// runs (gemini-3.6-flash), never the expensive reasoning model. One call per distinct screen, and
-// results are cached by screenshot hash, so re-captioning a run costs nothing.
+// A small, cheap vision model does the captioning -- never the expensive reasoning model. One call
+// per distinct screen, and results are cached by screenshot hash, so re-captioning a run costs
+// nothing. See captionProvider below for which model, on whose key.
 //
-//   GEMINI_API_KEY=... node scripts/caption-screens.mjs \
+//   ANTHROPIC_API_KEY=... node scripts/caption-screens.mjs \
 //     --trace runs/<run>/target-session-1/observations.jsonl \
 //     --output artifacts/<run>-captions.json
 
@@ -24,12 +24,65 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { retainedScreenshots } from "../renderer/render-map.mjs";
 
-const MODEL = process.env.CAPTION_MODEL ?? "gemini-3.6-flash";
-const BASE_URL =
-  process.env.CAPTION_BASE_URL ?? "https://generativelanguage.googleapis.com/v1beta/openai/";
+const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/";
+const GEMINI_MODEL = "gemini-3.6-flash";
+const ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1/";
+// The cheapest Claude that can see a picture. Captioning is a naming job, not a reasoning job, and
+// this is the model the price table in lib/scaffold.mjs already knows.
+const ANTHROPIC_MODEL = "claude-haiku-4-5";
 const DEFAULT_CACHE = resolve(
   new URL("../.runtime/screen-caption-cache.json", import.meta.url).pathname,
 );
+
+// Which host writes the captions, and why in this order.
+//
+// Captioning is a cheap vision call that every host here does well enough, so the order is about
+// whose key the user already has, not about which model is better:
+//
+//   1. CAPTION_BASE_URL + CAPTION_API_KEY -- named by hand, so it outranks anything we would pick,
+//      and the key set beside that URL is the one that host receives. (It used to receive
+//      GEMINI_API_KEY instead whenever that happened to be set: a Google key posted to a host the
+//      user chose for something else.) The pair is all-or-nothing, as the CLI help has always said;
+//      half of it is refused by name rather than silently completed from another variable.
+//   2. GEMINI_API_KEY -- what this script defaulted to before Claude was an option. Ahead of the
+//      Anthropic fallback so an environment that captions today captions identically tomorrow,
+//      cache included.
+//   3. ANTHROPIC_API_KEY -- the explorer's own key. `releashed map` cannot run without it, so this
+//      is the branch that matters: one key, and the screens still get names.
+//
+// CAPTION_MODEL overrides the model on whichever host is chosen.
+export function captionProvider(env = process.env) {
+  const model = env.CAPTION_MODEL;
+  if (env.CAPTION_BASE_URL || env.CAPTION_API_KEY) {
+    if (!env.CAPTION_BASE_URL || !env.CAPTION_API_KEY)
+      throw new Error(
+        `CAPTION_BASE_URL and CAPTION_API_KEY must be set together: ${env.CAPTION_BASE_URL ? "CAPTION_API_KEY" : "CAPTION_BASE_URL"} is missing`,
+      );
+    return {
+      kind: "openai-compatible",
+      baseUrl: env.CAPTION_BASE_URL,
+      apiKey: env.CAPTION_API_KEY,
+      model: model ?? GEMINI_MODEL,
+    };
+  }
+  if (env.GEMINI_API_KEY)
+    return {
+      kind: "openai-compatible",
+      baseUrl: GEMINI_BASE_URL,
+      apiKey: env.GEMINI_API_KEY,
+      model: model ?? GEMINI_MODEL,
+    };
+  if (env.ANTHROPIC_API_KEY)
+    return {
+      kind: "anthropic",
+      baseUrl: ANTHROPIC_BASE_URL,
+      apiKey: env.ANTHROPIC_API_KEY,
+      model: model ?? ANTHROPIC_MODEL,
+    };
+  throw new Error(
+    "No key to caption screens with: set ANTHROPIC_API_KEY (the key `releashed map` already needs), or GEMINI_API_KEY, or CAPTION_BASE_URL + CAPTION_API_KEY for any OpenAI-compatible vision host",
+  );
+}
 
 const PROMPT = [
   "You are labelling one screenshot of a web app so a reader can recognise the screen in a diagram.",
@@ -146,12 +199,44 @@ async function readJson(path, fallback) {
   }
 }
 
-async function captionOne(apiKey, bytes) {
-  const response = await fetch(new URL("chat/completions", BASE_URL), {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model: MODEL,
+// One screenshot in, one line of text out, on either wire shape. Both are plain fetch: the whole
+// call is a prompt and a PNG, and the two request bodies below say exactly what goes over the wire
+// -- an SDK for this would be a dependency to read instead of eight lines to read.
+function captionRequest(provider, image) {
+  if (provider.kind === "anthropic")
+    return {
+      url: new URL("messages", provider.baseUrl),
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": provider.apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: {
+        model: provider.model,
+        temperature: 0,
+        max_tokens: 600,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "image", source: { type: "base64", media_type: "image/png", data: image } },
+              { type: "text", text: PROMPT },
+            ],
+          },
+        ],
+      },
+      // Claude answers in content blocks, and a caption is the first text one.
+      read: (body) => ({
+        text: body.content?.find((block) => block?.type === "text")?.text,
+        prompt: body.usage?.input_tokens ?? 0,
+        completion: body.usage?.output_tokens ?? 0,
+      }),
+    };
+  return {
+    url: new URL("chat/completions", provider.baseUrl),
+    headers: { "content-type": "application/json", authorization: `Bearer ${provider.apiKey}` },
+    body: {
+      model: provider.model,
       temperature: 0,
       max_tokens: 600,
       messages: [
@@ -159,25 +244,35 @@ async function captionOne(apiKey, bytes) {
           role: "user",
           content: [
             { type: "text", text: PROMPT },
-            {
-              type: "image_url",
-              image_url: { url: `data:image/png;base64,${bytes.toString("base64")}` },
-            },
+            { type: "image_url", image_url: { url: `data:image/png;base64,${image}` } },
           ],
         },
       ],
+    },
+    read: (body) => ({
+      text: body.choices?.[0]?.message?.content,
+      prompt: body.usage?.prompt_tokens ?? 0,
+      completion: body.usage?.completion_tokens ?? 0,
     }),
+  };
+}
+
+export async function captionOne(provider, bytes) {
+  const request = captionRequest(provider, bytes.toString("base64"));
+  const response = await fetch(request.url, {
+    method: "POST",
+    headers: request.headers,
+    body: JSON.stringify(request.body),
   });
-  if (!response.ok) throw new Error(`Caption request failed: ${response.status}`);
-  const body = await response.json();
-  const text = body.choices?.[0]?.message?.content;
+  if (!response.ok)
+    throw new Error(`Caption request failed (${provider.model}): ${response.status}`);
+  const { text, prompt, completion } = request.read(await response.json());
   if (typeof text !== "string" || !text.trim()) throw new Error("Caption response was empty");
-  return { raw: text.slice(0, 400), usage: body.usage ?? {} };
+  return { raw: text.slice(0, 400), usage: { prompt, completion } };
 }
 
 export async function captionScreens({ tracePath, outputPath, cachePath = DEFAULT_CACHE }) {
-  const apiKey = process.env.GEMINI_API_KEY ?? process.env.CAPTION_API_KEY;
-  if (!apiKey) throw new Error("GEMINI_API_KEY is required to caption screens");
+  const provider = captionProvider();
   const events = (await readFile(tracePath, "utf8"))
     .split("\n")
     .filter(Boolean)
@@ -190,7 +285,7 @@ export async function captionScreens({ tracePath, outputPath, cachePath = DEFAUL
   let completionTokens = 0;
   let failures = 0;
   for (const [hash, shot] of shots) {
-    const key = `${MODEL}:${PROMPT_VERSION}:${shot.sha256}`;
+    const key = `${provider.model}:${PROMPT_VERSION}:${shot.sha256}`;
     if (typeof cache[key] === "string") {
       const cached = cleanCaption(cache[key]);
       if (cached) captions[hash] = cached;
@@ -198,10 +293,10 @@ export async function captionScreens({ tracePath, outputPath, cachePath = DEFAUL
     }
     const bytes = await readFile(resolve(dirname(tracePath), shot.path));
     try {
-      const result = await captionOne(apiKey, bytes);
+      const result = await captionOne(provider, bytes);
       calls += 1;
-      promptTokens += result.usage.prompt_tokens ?? 0;
-      completionTokens += result.usage.completion_tokens ?? 0;
+      promptTokens += result.usage.prompt;
+      completionTokens += result.usage.completion;
       cache[key] = result.raw;
       const caption = cleanCaption(result.raw);
       if (caption) captions[hash] = caption;
@@ -217,7 +312,7 @@ export async function captionScreens({ tracePath, outputPath, cachePath = DEFAUL
   await mkdir(dirname(resolve(outputPath)), { recursive: true });
   await writeFile(
     outputPath,
-    `${JSON.stringify({ schema_version: 1, model: MODEL, kind: "screen-descriptions", captions }, null, 2)}\n`,
+    `${JSON.stringify({ schema_version: 1, model: provider.model, kind: "screen-descriptions", captions }, null, 2)}\n`,
     { mode: 0o600 },
   );
   return {
