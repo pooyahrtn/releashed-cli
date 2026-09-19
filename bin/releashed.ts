@@ -54,7 +54,7 @@ import {
   formatRememberResult,
   rememberFlow,
 } from "../lib/product-notebook.ts";
-import { createLocalTiming } from "../lib/local-timing.mjs";
+import { createLocalTiming } from "../lib/local-timing.ts";
 import { captureDoctor } from "../lib/capture-doctor.ts";
 import { captureReport } from "../lib/capture-report.ts";
 import { startPhases, stampPhase } from "../lib/capture-phases.ts";
@@ -877,7 +877,7 @@ type PackageFn = (args: {
   outputPath: string;
   publicPackPath: string;
   publicPackSha256: string;
-  captions: Record<string, unknown>;
+  captions: Record<string, string>;
 }) => Promise<{ output_path: string }>;
 type StripFn = (args: {
   candidateDir: string;
@@ -1359,11 +1359,8 @@ export async function mapCommand(options: MapOptions, deps: MapDeps = {}) {
         m.captionScreens(args),
       ),
     packageRun = (args) =>
-      import("../lib/candidate-packager.mjs").then(
-        // Boundary is untyped until candidate-packager migrates to .ts (batch C2): label it,
-        // don't cast it. Runtime requires the PackageFn string paths (it fails otherwise); the
-        // `= null` defaults only narrow the JS inference, so the contract stands regardless.
-        (m: { packageCandidate: (args: any) => any }) => m.packageCandidate(args),
+      import("../lib/candidate-packager.ts").then((m) =>
+        m.packageCandidate(args),
       ),
     strip = (args) =>
       import("../lib/flow-strip.ts").then((m) => m.renderStrip(args)),
@@ -1827,7 +1824,7 @@ export async function exploreCommand(
   options: Extract<ParsedOptions, { command: "explore-mcp" }>,
   deps: SessionDeps & {
     timing?: ReturnType<typeof createLocalTiming>;
-    serve?: typeof import("../lib/explore-mcp.mjs").serveExplorer;
+    serve?: typeof import("../lib/explore-mcp.ts").serveExplorer;
   } = {},
 ) {
   const out = deps.out ?? outputRoot();
@@ -1837,7 +1834,7 @@ export async function exploreCommand(
   const serve =
     deps.serve ??
     ((args) =>
-      import("../lib/explore-mcp.mjs").then((module) =>
+      import("../lib/explore-mcp.ts").then((module) =>
         module.serveExplorer(args),
       ));
   try {

@@ -13,6 +13,12 @@
 // Either way the result is the same file `releashed login` writes, so everything downstream --
 // loadSavedSession, the sign-in-landing-page refusal, the boundary -- is untouched.
 import { chmod, mkdir, writeFile } from "node:fs/promises";
+
+// Local copy of the supervisor's CDP-record guard: auth-cmd stays independent of the
+// supervisor package so the sign-in context keeps no broker dependency.
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
 import { exec } from "node:child_process";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -86,14 +92,19 @@ async function redeemSignInUrl(
     const deadline = Date.now() + timeoutMs;
     let href: string = ticketUrl;
     for (;;) {
-      href =
-        (
-          await browser.cdp.send(
-            "Runtime.evaluate",
-            { expression: "location.href", returnByValue: true },
-            browser.sessionId,
-          )
-        ).result?.value ?? "about:blank";
+      const evaluated = await browser.cdp.send(
+        "Runtime.evaluate",
+        { expression: "location.href", returnByValue: true },
+        browser.sessionId,
+      );
+      const evaluatedValue: unknown = isRecord(evaluated.result) ? evaluated.result.value : undefined;
+      // A non-string location is a corrupt peer: fail now with the domain refusal instead of
+      // crashing on `.startsWith` below. Either way the run refuses; this one says where.
+      if (typeof evaluatedValue !== "string")
+        throw new Error(
+          `--auth-cmd's sign-in link never resolved to a location (still at ${ticketUrl}): a refusal is a finding, not something to work around`,
+        );
+      href = evaluatedValue;
       if (href.startsWith("http") && !isAuthFlowUrl(href)) break;
       if (Date.now() > deadline)
         throw new Error(

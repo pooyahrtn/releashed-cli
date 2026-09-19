@@ -7,7 +7,7 @@ import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateCaptureMetadata } from "./capture-metadata.ts";
 import { resolveLocatorConfig } from "./caller-locator.ts";
-import { inspectProspectiveOutput } from "./candidate-packager.mjs";
+import { inspectProspectiveOutput } from "./candidate-packager.ts";
 import type { CaptureMetadataInput } from "./capture-types.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");

@@ -296,8 +296,8 @@ export function isPermittedClerkMutation({
 }: {
   rawUrl: string;
   method: string;
-  frontendApiOrigin: string;
-  phase: string;
+  frontendApiOrigin?: string;
+  phase: string | null;
   activeSessionId?: string | null;
 }): boolean {
   if (String(method).toUpperCase() !== "POST") return false;
@@ -334,7 +334,7 @@ export function isPermittedClerkMutation({
   }
   const sessionId = activeSessionId ?? "";
   if (
-    ["activating", "active"].includes(phase) &&
+    ["activating", "active"].includes(phase ?? "") &&
     /^[A-Za-z0-9_-]{4,256}$/.test(sessionId)
   ) {
     const encoded = encodeURIComponent(sessionId);
@@ -356,8 +356,8 @@ export function provisionalClerkBootstrapTouchSessionId({
 }: {
   rawUrl: string;
   method: string;
-  frontendApiOrigin: string;
-  phase: string;
+  frontendApiOrigin?: string;
+  phase: string | null;
 }): string | null {
   if (phase !== "bootstrap" || String(method).toUpperCase() !== "POST")
     return null;

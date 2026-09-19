@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
-import { CdpConnection, waitForDevToolsPort } from "../supervisor/browser-broker.mjs";
+import { CdpConnection, isRecord, waitForDevToolsPort } from "../supervisor/browser-broker.mjs";
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
 function parseArgs(argv) {
@@ -87,7 +87,10 @@ async function dumpStorage(cdp, sessionId) {
     return JSON.stringify({ local: dump(localStorage), session: dump(sessionStorage) });
   })()`;
     const result = await cdp.send("Runtime.evaluate", { expression: script, returnByValue: true }, sessionId);
-    return JSON.parse(result.result?.value ?? '{"local":{},"session":{}}');
+    // CDP answers with `{ result: { value } }`; anything else is a corrupt peer and parses
+    // as an empty sidecar, exactly as the old `??` fallback did for a missing result.
+    const dumped = isRecord(result.result) ? result.result.value : undefined;
+    return JSON.parse(typeof dumped === "string" ? dumped : '{"local":{},"session":{}}');
 }
 // Attaches CDP to a just-spawned browser's one page and enables the domains every caller below
 // needs. Shared by launchVisibleBrowser and launchRealChromeWithProfile so the "find the page,
@@ -96,13 +99,18 @@ async function attachFirstPage(profileDirectory) {
     const cdp = await connectCdp(profileDirectory);
     await cdp.send("Target.setDiscoverTargets", { discover: true });
     const targets = await cdp.send("Target.getTargets");
+    if (!Array.isArray(targets.targetInfos))
+        throw new Error("The browser did not list its targets");
     const page = targets.targetInfos.find((target) => target.type === "page");
     if (!page)
         throw new Error("The browser did not open a page");
-    const { sessionId } = await cdp.send("Target.attachToTarget", {
+    const attached = await cdp.send("Target.attachToTarget", {
         targetId: page.targetId,
         flatten: true,
     });
+    if (typeof attached.sessionId !== "string")
+        throw new Error("The browser did not attach to its page");
+    const sessionId = attached.sessionId;
     await cdp.send("Page.enable", {}, sessionId);
     await cdp.send("Runtime.enable", {}, sessionId);
     await cdp.send("Network.enable", {}, sessionId);
@@ -193,8 +201,15 @@ async function launchRealChromeWithProfile(url, profileName = "Profile 5", { chr
 // current origin) and writes it in the exact shape targets/*.json's "saved-session" auth mode
 // expects. Shared tail end of both the interactive and non-interactive capture paths.
 async function saveSession(cdp, sessionId, { url, name, outputDir }) {
-    const cookies = (await cdp.send("Network.getAllCookies", {}, sessionId)).cookies ?? [];
-    const href = (await cdp.send("Runtime.evaluate", { expression: "location.href", returnByValue: true }, sessionId)).result?.value;
+    const rawCookies = (await cdp.send("Network.getAllCookies", {}, sessionId)).cookies ?? [];
+    if (!Array.isArray(rawCookies))
+        throw new Error("The browser did not return its cookies");
+    const cookies = rawCookies;
+    const evaluated = await cdp.send("Runtime.evaluate", { expression: "location.href", returnByValue: true }, sessionId);
+    const evaluatedValue = isRecord(evaluated.result) ? evaluated.result.value : undefined;
+    if (typeof evaluatedValue !== "string")
+        throw new Error("The browser did not return its location");
+    const href = evaluatedValue;
     const origin = new URL(href).origin;
     const storage = await dumpStorage(cdp, sessionId);
     const session = {

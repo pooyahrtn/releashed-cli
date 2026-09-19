@@ -1026,11 +1026,7 @@ export async function exploreSessionPath(options, deps = {}) {
     return path;
 }
 export async function mapCommand(options, deps = {}) {
-    const { authorPack = (url) => import("../scripts/author-target-pack.mjs").then((m) => m.authorTargetPack(url)), login = captureLogin, authSession = (args) => import("../lib/auth-cmd.mjs").then((m) => m.sessionFromAuthCmd(args)), explore = runExplorer, caption = (args) => import("../scripts/caption-screens.mjs").then((m) => m.captionScreens(args)), packageRun = (args) => import("../lib/candidate-packager.mjs").then(
-    // Boundary is untyped until candidate-packager migrates to .ts (batch C2): label it,
-    // don't cast it. Runtime requires the PackageFn string paths (it fails otherwise); the
-    // `= null` defaults only narrow the JS inference, so the contract stands regardless.
-    (m) => m.packageCandidate(args)), strip = (args) => import("../lib/flow-strip.mjs").then((m) => m.renderStrip(args)), sha256 = (bytes) => import("../lib/scaffold.mjs").then((m) => m.sha256Text(bytes)), agents = writeAgentsBlock, log = console.log, } = deps;
+    const { authorPack = (url) => import("../scripts/author-target-pack.mjs").then((m) => m.authorTargetPack(url)), login = captureLogin, authSession = (args) => import("../lib/auth-cmd.mjs").then((m) => m.sessionFromAuthCmd(args)), explore = runExplorer, caption = (args) => import("../scripts/caption-screens.mjs").then((m) => m.captionScreens(args)), packageRun = (args) => import("../lib/candidate-packager.mjs").then((m) => m.packageCandidate(args)), strip = (args) => import("../lib/flow-strip.mjs").then((m) => m.renderStrip(args)), sha256 = (bytes) => import("../lib/scaffold.mjs").then((m) => m.sha256Text(bytes)), agents = writeAgentsBlock, log = console.log, } = deps;
     const out = deps.out ?? outputRoot();
     const id = `${slug(options.url)}-${stamp()}`;
     // Filesystem-only provenance validation precedes authoring, login, auth commands, and the walk.
