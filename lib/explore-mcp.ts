@@ -250,6 +250,44 @@ function thrownMessage(error: unknown): string {
   return String(error);
 }
 
+type CaptureFailureCategory =
+  | "target_closed"
+  | "timeout"
+  | "protocol_error"
+  | "navigation_interrupted"
+  | "unknown";
+
+class ScreenshotCaptureError extends Error {
+  constructor(readonly cause: unknown) {
+    super("screenshot capture failed");
+  }
+}
+
+function captureFailureCategory(error: unknown): CaptureFailureCategory {
+  let text = "";
+  try {
+    const source = error instanceof ScreenshotCaptureError ? error.cause : error;
+    const fields: string[] = [thrownMessage(source)];
+    if (source && typeof source === "object") {
+      const value = source as Record<string, unknown>;
+      if (typeof value.name === "string") fields.push(value.name);
+      if (typeof value.code === "string") fields.push(value.code);
+    }
+    text = fields.join(" ").toLowerCase();
+  } catch {
+    return "unknown";
+  }
+  if (/(target|page|browser|context).*(closed|crashed)|targetclosed|err_target_closed/.test(text))
+    return "target_closed";
+  if (/timeout|timed out|deadline exceeded|err_timed_out/.test(text))
+    return "timeout";
+  if (/protocol error|protocolerror|cdp|session.*closed/.test(text))
+    return "protocol_error";
+  if (/navigation.*(interrupted|aborted)|err_aborted|frame.*detached|execution context was destroyed/.test(text))
+    return "navigation_interrupted";
+  return "unknown";
+}
+
 const defaultLaunchMeasure: LaunchMeasure = (_name, work) => work();
 
 export type CreateExplorerOptions = {
@@ -1106,7 +1144,13 @@ export function createExplorer({
     const capturePage: ExplorerPage = captureTransitions
       ? {
           url: () => page.url(),
-          screenshot: async () => (acquiredPng = await page.screenshot()),
+          screenshot: async () => {
+            try {
+              return (acquiredPng = await page.screenshot());
+            } catch (error) {
+              throw new ScreenshotCaptureError(error);
+            }
+          },
           evaluate: () => {
             throw new Error("capture stub has no DOM access");
           },
@@ -1491,7 +1535,7 @@ export function createExplorer({
           if (!inputStarted) state.stepsUsed -= 1;
           return toolError(state.scopeExit);
         }
-        if (captureTransitions && inputStarted) return captureFailed();
+        if (captureTransitions && inputStarted) return captureFailed(error, "dispatch");
         if (error instanceof CutoffExpiredError) {
           state.stepsUsed -= 1;
           return cutoffRefusal();
@@ -1629,8 +1673,36 @@ export function createExplorer({
     });
   }
 
-  function captureFailed(): ToolResult {
+  async function writeCaptureDiagnostic(
+    error: unknown,
+    phase: "dispatch" | "immediate" | "settled",
+    recovery: "recovered" | "failed" | null = null,
+  ): Promise<void> {
+    try {
+      await mkdir(timing.directory, { recursive: true, mode: 0o700 });
+      const diagnostic = {
+        schema_version: 1,
+        phase,
+        error: { category: captureFailureCategory(error) },
+        ...(recovery ? { recovery } : {}),
+      };
+      await writeFile(
+        join(timing.directory, "capture-failure.json"),
+        `${JSON.stringify(diagnostic)}\n`,
+        { flag: "wx", mode: 0o600 },
+      );
+    } catch {
+      // Failure diagnostics are best effort and never alter the capture stop behavior.
+    }
+  }
+
+  async function captureFailed(
+    error: unknown,
+    phase: "dispatch" | "immediate" | "settled",
+    recovery: "recovered" | "failed" | null = null,
+  ): Promise<ToolResult> {
     state.captureFailure = "Capture failed after input started; its effect is unknown. No more input will be dispatched. Record any pending acquired frames, then finish with goal_reached: false or close; never repeat this input.";
+    await writeCaptureDiagnostic(error, phase, recovery);
     return toolError(state.captureFailure);
   }
 
@@ -1671,18 +1743,60 @@ export function createExplorer({
         });
       }
     };
+    let phase: "immediate" | "settled" = "immediate";
+    let recoveryError: unknown = null;
+    let recoveryAttempted = false;
+    const pageIsOpen = (): boolean => {
+      if (browserClosed) return false;
+      try {
+        return typeof page.isClosed !== "function" || !page.isClosed();
+      } catch {
+        return false;
+      }
+    };
+    const canReacquire = (error: unknown): boolean =>
+      !recoveryAttempted &&
+      phase === "immediate" &&
+      !state.pending &&
+      !state.scopeExit &&
+      !acquireExpired() &&
+      pageIsOpen() &&
+      error instanceof ScreenshotCaptureError &&
+      captureFailureCategory(error) === "protocol_error";
     try {
-      const immediate = (await snapshot(decision)).evidence;
+      let immediate: SealedEvidence;
+      try {
+        immediate = (await snapshot(decision)).evidence;
+      } catch (error) {
+        if (!canReacquire(error)) throw error;
+        recoveryAttempted = true;
+        recoveryError = error;
+        try {
+          immediate = (await timing.span("screenshot.reacquire", () => snapshot(decision))).evidence;
+        } catch (reacquireError) {
+          if (state.scopeExit) {
+            await writeCaptureDiagnostic(error, "immediate", "failed");
+            return toolError(state.scopeExit);
+          }
+          return captureFailed(reacquireError, "immediate", "failed");
+        }
+      }
       state.pending = event(before, immediate, RECORDED_METHOD[decision.action], state.events.length + 1);
       checkFrame(immediate);
+      phase = "settled";
       await timing.span("wait.settle", () => page.waitForTimeout(1_500));
       const settled = (await snapshot(decision)).evidence;
       state.pendingTail = [event(immediate, settled, "wait", state.events.length + 2)];
       checkFrame(settled);
+      if (recoveryError) await writeCaptureDiagnostic(recoveryError, "immediate", "recovered");
       return completedAct(before, settled, identified, false,
         state.walled ? { reason: state.walled } : null);
-    } catch {
-      return state.scopeExit ? toolError(state.scopeExit) : captureFailed();
+    } catch (error) {
+      if (state.scopeExit) {
+        if (recoveryError) await writeCaptureDiagnostic(recoveryError, "immediate", "recovered");
+        return toolError(state.scopeExit);
+      }
+      return captureFailed(error, phase, recoveryAttempted ? "recovered" : null);
     }
   }
 
