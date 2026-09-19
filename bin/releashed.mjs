@@ -81,6 +81,7 @@ const USAGE = `releashed -- an evidence-backed map of a product's user flows, fr
       --policy "<English>" how to behave on the way -- conduct, not a route (needs --goal)
       --continues <run-id>  this capture follows an existing run; records a pointer, never replays it
       --precondition "<English>" state arranged outside the walk; refer to prior runs as "run <id>"
+      --expect "<English>"   what the owner expects to see when the goal is reached; sealed with the run
       --identity-label <label> nonsecret opaque account label, recorded without reading session names
       --force-map-pointer  point AGENTS.md/CLAUDE.md at this run's map anyway: even with fewer
                            screens than the map already pointed to, and even for a directed
@@ -156,6 +157,7 @@ const USAGE = `releashed -- an evidence-backed map of a product's user flows, fr
       --policy "<English>" how to behave on the way -- conduct, not a route (needs --goal)
       --continues <run-id>  this capture follows an existing run; records a pointer, never replays it
       --precondition "<English>" state arranged outside the walk; refer to prior runs as "run <id>"
+      --expect "<English>"   what the owner expects to see when the goal is reached; sealed with the run
       --identity-label <label> nonsecret opaque account label, recorded without reading session names
       --acquire-until <ISO> absolute acquisition cutoff, e.g. 2026-09-10T11:20:00.000Z: after it
                             no new act (including wait) is dispatched; pending record, observe
@@ -340,6 +342,7 @@ export function parseArgs(argv) {
         "policy",
         "continues",
         "precondition",
+        "expect",
         "identity-label",
         "screenshots",
         "why",
@@ -469,15 +472,18 @@ export function parseArgs(argv) {
     const policy = typeof flags.policy === "string" ? flags.policy : null;
     const continues = typeof flags.continues === "string" ? assertRunId(flags.continues) : null;
     const precondition = typeof flags.precondition === "string" ? flags.precondition : null;
+    const expect = typeof flags.expect === "string" ? flags.expect : null;
     const identityLabel = typeof flags["identity-label"] === "string"
         ? flags["identity-label"]
         : null;
     if (precondition !== null && !precondition.trim())
         throw new Error("--precondition must be non-empty plain English");
+    if (expect !== null && !expect.trim())
+        throw new Error("--expect must be non-empty plain English");
     if (policy && !goal)
         throw new Error("--policy says how to behave while pursuing a --goal; pass one");
-    if ((continues || precondition || identityLabel) && !goal)
-        throw new Error("--continues, --precondition, and --identity-label need --goal");
+    if ((continues || precondition || expect || identityLabel) && !goal)
+        throw new Error("--continues, --precondition, --expect, and --identity-label need --goal");
     // Two ways in, never both: one is a person at a window, the other is your own backend.
     if (flags.login === true && flags["auth-cmd"] !== undefined)
         throw new Error("--login and --auth-cmd are two ways to sign in; pick one");
@@ -530,6 +536,7 @@ export function parseArgs(argv) {
             policy,
             continues,
             precondition,
+            expect,
             identityLabel,
             forceMapPointer: flags["force-map-pointer"] === true,
         };
@@ -671,6 +678,7 @@ export function parseArgs(argv) {
             policy,
             continues,
             precondition,
+            expect,
             identityLabel,
             acquireUntil,
         };
@@ -742,7 +750,7 @@ export async function captureLogin(url, sessionDir) {
 // The explorer itself: SPIKE_APP_URL fixes the origin, the config fixes everything else, and the
 // run directory is ours to name so a global install never writes inside node_modules. It prints the
 // run directory it wrote; that line is how we find it.
-async function runExplorer({ url, configPath, steps, model, minutes, budgetEur, runDir, goal = null, policy = null, continues = null, precondition = null, identityLabel = null, }) {
+async function runExplorer({ url, configPath, steps, model, minutes, budgetEur, runDir, goal = null, policy = null, continues = null, precondition = null, expect = null, identityLabel = null, }) {
     const args = [
         join(ROOT, "scripts/vision-explorer-run.mjs"),
         "--steps",
@@ -766,6 +774,8 @@ async function runExplorer({ url, configPath, steps, model, minutes, budgetEur, 
         args.push("--continues", continues);
     if (precondition)
         args.push("--precondition", precondition);
+    if (expect)
+        args.push("--expect", expect);
     if (identityLabel)
         args.push("--identity-label", identityLabel);
     const out = await run(process.execPath, args, {
@@ -1016,7 +1026,11 @@ export async function exploreSessionPath(options, deps = {}) {
     return path;
 }
 export async function mapCommand(options, deps = {}) {
-    const { authorPack = (url) => import("../scripts/author-target-pack.mjs").then((m) => m.authorTargetPack(url)), login = captureLogin, authSession = (args) => import("../lib/auth-cmd.mjs").then((m) => m.sessionFromAuthCmd(args)), explore = runExplorer, caption = (args) => import("../scripts/caption-screens.mjs").then((m) => m.captionScreens(args)), packageRun = (args) => import("../lib/candidate-packager.mjs").then((m) => m.packageCandidate(args)), strip = (args) => import("../lib/flow-strip.mjs").then((m) => m.renderStrip(args)), sha256 = (bytes) => import("../lib/scaffold.mjs").then((m) => m.sha256Text(bytes)), agents = writeAgentsBlock, log = console.log, } = deps;
+    const { authorPack = (url) => import("../scripts/author-target-pack.mjs").then((m) => m.authorTargetPack(url)), login = captureLogin, authSession = (args) => import("../lib/auth-cmd.mjs").then((m) => m.sessionFromAuthCmd(args)), explore = runExplorer, caption = (args) => import("../scripts/caption-screens.mjs").then((m) => m.captionScreens(args)), packageRun = (args) => import("../lib/candidate-packager.mjs").then(
+    // Boundary is untyped until candidate-packager migrates to .ts (batch C2): label it,
+    // don't cast it. Runtime requires the PackageFn string paths (it fails otherwise); the
+    // `= null` defaults only narrow the JS inference, so the contract stands regardless.
+    (m) => m.packageCandidate(args)), strip = (args) => import("../lib/flow-strip.mjs").then((m) => m.renderStrip(args)), sha256 = (bytes) => import("../lib/scaffold.mjs").then((m) => m.sha256Text(bytes)), agents = writeAgentsBlock, log = console.log, } = deps;
     const out = deps.out ?? outputRoot();
     const id = `${slug(options.url)}-${stamp()}`;
     // Filesystem-only provenance validation precedes authoring, login, auth commands, and the walk.
@@ -1112,6 +1126,7 @@ export async function mapCommand(options, deps = {}) {
         policy: options.policy ?? null,
         continues: options.continues ?? null,
         precondition: options.precondition ?? null,
+        expect: options.expect ?? null,
         identityLabel: options.identityLabel ?? null,
     });
     const runId = runPath.split("/").at(-2);
@@ -1305,7 +1320,7 @@ export async function doctor(deps = {}) {
     return checks;
 }
 // Reads two candidates' map.json (docs/map-schema.md) and reports what changed. The exit code IS
-// the product here: a nightly job reads it, not the prose. See lib/map-diff.mjs for the matching
+// the product here: a nightly job reads it, not the prose. See lib/map-diff.ts for the matching
 // rule and for why disappearance, not appearance, is the failure signal.
 export async function diffCommand(options, deps = {}) {
     const { readMap = async (dir) => JSON.parse(await readFile(join(dir, "map.json"), "utf8")), log = console.log, } = deps;
@@ -1406,6 +1421,7 @@ export async function exploreCommand(options, deps = {}) {
             policy: options.policy,
             continues: options.continues,
             precondition: options.precondition,
+            expect: options.expect,
             identityLabel: options.identityLabel,
             acquireUntil: options.acquireUntil ?? null,
             runsRoot: join(out, "runs"),

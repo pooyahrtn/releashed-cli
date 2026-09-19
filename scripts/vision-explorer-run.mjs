@@ -206,6 +206,7 @@ export function options(argv) {
     policy: null,
     continues: null,
     precondition: null,
+    expect: null,
     identityLabel: null,
     // Where the retained run is written. The default is the installation's own runs/ directory,
     // byte-for-byte where every existing run went; the CLI passes a directory in the user's project
@@ -222,6 +223,7 @@ export function options(argv) {
     else if (argv[i] === "--policy") values.policy = argv[i + 1];
     else if (argv[i] === "--continues") values.continues = assertRunId(argv[i + 1]);
     else if (argv[i] === "--precondition") values.precondition = argv[i + 1];
+    else if (argv[i] === "--expect") values.expect = argv[i + 1];
     else if (argv[i] === "--identity-label") values.identityLabel = argv[i + 1];
     else throw new Error(`Unknown argument ${argv[i]}`);
   }
@@ -229,7 +231,7 @@ export function options(argv) {
   // owner's own words entering a source-blind walk, which discovery mode does not take.
   if (values.policy && !values.goal) throw new Error("--policy describes how to behave while pursuing a --goal; pass one");
   if (values.precondition !== null && !values.precondition.trim()) throw new Error("--precondition must be non-empty plain English");
-  if ((values.continues || values.precondition || values.identityLabel) && !values.goal)
+  if ((values.continues || values.precondition || values.expect || values.identityLabel) && !values.goal)
     throw new Error("--continues, --precondition, and --identity-label need --goal");
   if (!Number.isInteger(values.steps) || values.steps < 1 || values.steps > MAX_STEPS)
     throw new Error(`--steps must be 1..${MAX_STEPS}`);
@@ -734,7 +736,7 @@ export function sealDoneDecision({ goal, step, decisionWhy, claimScreenshotPath,
 }
 
 async function main() {
-  const { app, steps: maxSteps, targetConfigPath, minutes, maxEur, runDirRoot, goal, policy, continues, precondition, identityLabel } = options(process.argv.slice(2));
+  const { app, steps: maxSteps, targetConfigPath, minutes, maxEur, runDirRoot, goal, policy, continues, precondition, expect, identityLabel } = options(process.argv.slice(2));
   // Discovery with no goal, capture with one. The brief is built once and never changes mid-run.
   const brief = explorerBrief(goal, policy);
   const target = await resolveTarget(app, targetConfigPath);
@@ -1296,6 +1298,7 @@ async function main() {
               ...(policy ? { policy } : {}),
               ...(continues ? { continues } : {}),
               ...(precondition ? { precondition } : {}),
+              ...(expect ? { expected: expect } : {}),
               ...(stopReason === "goal_claimed"
                 ? { goal_claimed_at_step: goalReachedAtStep, goal_screenshot_path: goalScreenshotPath }
                 : {}),

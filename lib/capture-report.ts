@@ -2,9 +2,9 @@
 // This does not authenticate, inspect images, or certify the truth of customer receipts.
 import { readFile, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
-import { assertRunId } from './capture-metadata.mjs';
+import { assertRunId } from './capture-metadata.ts';
 import { findCapture } from './capture-memory.ts';
-import { digest, sealedFile } from './capture-selection.mjs';
+import { digest, sealedFile } from './capture-selection.ts';
 
 export type ReportOptions = {
   mapsRoot: string; runId: string; preparation: string; cleanup: string;

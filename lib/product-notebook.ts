@@ -24,8 +24,8 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { findCapture, findCaptures } from "./capture-memory.ts";
 import type { CaptureMemoryResult } from "./capture-memory.ts";
 import type { FreshnessOptions } from "./capture-policy.ts";
-import { assertRunId } from "./capture-metadata.mjs";
-import { digest, sealedFile } from "./capture-selection.mjs";
+import { assertRunId } from "./capture-metadata.ts";
+import { digest, sealedFile } from "./capture-selection.ts";
 
 export const NOTE_SCHEMA_VERSION = 1;
 export const MAX_NOTE_INPUT_BYTES = 64 * 1024;

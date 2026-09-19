@@ -5,13 +5,13 @@ import { readFile, readdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { capturePolicy, evidenceFreshness } from "./capture-policy.ts";
 import type { FreshnessOptions } from "./capture-policy.ts";
-import { assertRunId } from "./capture-metadata.mjs";
+import { assertRunId } from "./capture-metadata.ts";
 import {
   digest,
   sealedFile,
   selectionPath,
   verifySelection,
-} from "./capture-selection.mjs";
+} from "./capture-selection.ts";
 
 type CaptureMap = {
   run_id: string;

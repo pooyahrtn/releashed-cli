@@ -30,21 +30,21 @@ import {
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { diffMaps, formatDiff, hasDisappearance } from "../lib/map-diff.mjs";
+import { diffMaps, formatDiff, hasDisappearance } from "../lib/map-diff.ts";
 import { MAX_STEPS } from "../lib/run-limits.mjs";
-import { hasGeminiKey } from "../lib/scaffold.mjs";
+import { hasGeminiKey } from "../lib/scaffold.ts";
 import {
   BROWSER_REFUSAL,
   MIN_NODE_MAJOR,
   missingModelKeys,
   nodeRefusal,
   spendNotice,
-} from "../lib/first-run.mjs";
+} from "../lib/first-run.ts";
 import {
   assertRunId,
   validateCaptureMetadata,
-} from "../lib/capture-metadata.mjs";
-import { selectCapture } from "../lib/capture-selection.mjs";
+} from "../lib/capture-metadata.ts";
+import { selectCapture } from "../lib/capture-selection.ts";
 import {
   MAX_NOTE_INPUT_BYTES,
   findMemory,
@@ -55,7 +55,7 @@ import {
   rememberFlow,
 } from "../lib/product-notebook.ts";
 import { createLocalTiming } from "../lib/local-timing.mjs";
-import { captureDoctor } from "../lib/capture-doctor.mjs";
+import { captureDoctor } from "../lib/capture-doctor.ts";
 import { captureReport } from "../lib/capture-report.ts";
 import { startPhases, stampPhase } from "../lib/capture-phases.ts";
 import {
@@ -154,6 +154,7 @@ const USAGE = `releashed -- an evidence-backed map of a product's user flows, fr
       --policy "<English>" how to behave on the way -- conduct, not a route (needs --goal)
       --continues <run-id>  this capture follows an existing run; records a pointer, never replays it
       --precondition "<English>" state arranged outside the walk; refer to prior runs as "run <id>"
+      --expect "<English>"   what the owner expects to see when the goal is reached; sealed with the run
       --identity-label <label> nonsecret opaque account label, recorded without reading session names
       --force-map-pointer  point AGENTS.md/CLAUDE.md at this run's map anyway: even with fewer
                            screens than the map already pointed to, and even for a directed
@@ -229,6 +230,7 @@ const USAGE = `releashed -- an evidence-backed map of a product's user flows, fr
       --policy "<English>" how to behave on the way -- conduct, not a route (needs --goal)
       --continues <run-id>  this capture follows an existing run; records a pointer, never replays it
       --precondition "<English>" state arranged outside the walk; refer to prior runs as "run <id>"
+      --expect "<English>"   what the owner expects to see when the goal is reached; sealed with the run
       --identity-label <label> nonsecret opaque account label, recorded without reading session names
       --acquire-until <ISO> absolute acquisition cutoff, e.g. 2026-09-10T11:20:00.000Z: after it
                             no new act (including wait) is dispatched; pending record, observe
@@ -429,6 +431,7 @@ export function parseArgs(argv: string[]) {
     "policy",
     "continues",
     "precondition",
+    "expect",
     "identity-label",
     "screenshots",
     "why",
@@ -603,19 +606,22 @@ export function parseArgs(argv: string[]) {
     typeof flags.continues === "string" ? assertRunId(flags.continues) : null;
   const precondition =
     typeof flags.precondition === "string" ? flags.precondition : null;
+  const expect = typeof flags.expect === "string" ? flags.expect : null;
   const identityLabel =
     typeof flags["identity-label"] === "string"
       ? flags["identity-label"]
       : null;
   if (precondition !== null && !precondition.trim())
     throw new Error("--precondition must be non-empty plain English");
+  if (expect !== null && !expect.trim())
+    throw new Error("--expect must be non-empty plain English");
   if (policy && !goal)
     throw new Error(
       "--policy says how to behave while pursuing a --goal; pass one",
     );
-  if ((continues || precondition || identityLabel) && !goal)
+  if ((continues || precondition || expect || identityLabel) && !goal)
     throw new Error(
-      "--continues, --precondition, and --identity-label need --goal",
+      "--continues, --precondition, --expect, and --identity-label need --goal",
     );
   // Two ways in, never both: one is a person at a window, the other is your own backend.
   if (flags.login === true && flags["auth-cmd"] !== undefined)
@@ -673,6 +679,7 @@ export function parseArgs(argv: string[]) {
       policy,
       continues,
       precondition,
+      expect,
       identityLabel,
       forceMapPointer: flags["force-map-pointer"] === true,
     } as const;
@@ -829,6 +836,7 @@ export function parseArgs(argv: string[]) {
       policy,
       continues,
       precondition,
+      expect,
       identityLabel,
       acquireUntil,
     } as const;
@@ -849,6 +857,7 @@ type ExplorerOptions = Pick<
   | "policy"
   | "continues"
   | "precondition"
+  | "expect"
   | "identityLabel"
 > & { configPath: string; runDir: string };
 type SessionOptions = {
@@ -877,10 +886,10 @@ type StripFn = (args: {
   subheading: string;
 }) => Promise<unknown>;
 type MapDeps = SessionDeps & {
-  authorPack?: typeof import("../scripts/author-target-pack.mjs").authorTargetPack;
+  authorPack?: typeof import("../scripts/author-target-pack.ts").authorTargetPack;
   login?: typeof captureLogin;
   explore?: typeof runExplorer;
-  caption?: typeof import("../scripts/caption-screens.mjs").captionScreens;
+  caption?: typeof import("../scripts/caption-screens.ts").captionScreens;
   packageRun?: PackageFn;
   strip?: StripFn;
   sha256?: (bytes: Buffer) => Promise<string>;
@@ -989,6 +998,7 @@ async function runExplorer({
   policy = null,
   continues = null,
   precondition = null,
+  expect = null,
   identityLabel = null,
 }: ExplorerOptions) {
   const args = [
@@ -1008,6 +1018,7 @@ async function runExplorer({
   if (policy) args.push("--policy", policy);
   if (continues) args.push("--continues", continues);
   if (precondition) args.push("--precondition", precondition);
+  if (expect) args.push("--expect", expect);
   if (identityLabel) args.push("--identity-label", identityLabel);
   const out = await run(process.execPath, args, {
     capture: true,
@@ -1336,7 +1347,7 @@ export async function exploreSessionPath(
 export async function mapCommand(options: MapOptions, deps: MapDeps = {}) {
   const {
     authorPack = (url) =>
-      import("../scripts/author-target-pack.mjs").then((m) =>
+      import("../scripts/author-target-pack.ts").then((m) =>
         m.authorTargetPack(url),
       ),
     login = captureLogin,
@@ -1344,19 +1355,20 @@ export async function mapCommand(options: MapOptions, deps: MapDeps = {}) {
       import("../lib/auth-cmd.mjs").then((m) => m.sessionFromAuthCmd(args)),
     explore = runExplorer,
     caption = (args) =>
-      import("../scripts/caption-screens.mjs").then((m) =>
+      import("../scripts/caption-screens.ts").then((m) =>
         m.captionScreens(args),
       ),
     packageRun = (args) =>
-      import("../lib/candidate-packager.mjs").then((m) =>
-        (m.packageCandidate as unknown as PackageFn)(args),
+      import("../lib/candidate-packager.mjs").then(
+        // Boundary is untyped until candidate-packager migrates to .ts (batch C2): label it,
+        // don't cast it. Runtime requires the PackageFn string paths (it fails otherwise); the
+        // `= null` defaults only narrow the JS inference, so the contract stands regardless.
+        (m: { packageCandidate: (args: any) => any }) => m.packageCandidate(args),
       ),
     strip = (args) =>
-      import("../lib/flow-strip.mjs").then((m) =>
-        (m.renderStrip as unknown as StripFn)(args),
-      ),
+      import("../lib/flow-strip.ts").then((m) => m.renderStrip(args)),
     sha256 = (bytes) =>
-      import("../lib/scaffold.mjs").then((m) => m.sha256Text(bytes)),
+      import("../lib/scaffold.ts").then((m) => m.sha256Text(bytes)),
     agents = writeAgentsBlock,
     log = console.log,
   } = deps;
@@ -1476,6 +1488,7 @@ export async function mapCommand(options: MapOptions, deps: MapDeps = {}) {
     policy: options.policy ?? null,
     continues: options.continues ?? null,
     precondition: options.precondition ?? null,
+    expect: options.expect ?? null,
     identityLabel: options.identityLabel ?? null,
   });
   const runId = runPath.split("/").at(-2)!;
@@ -1713,7 +1726,7 @@ export async function doctor(deps: DoctorDeps = {}) {
 }
 
 // Reads two candidates' map.json (docs/map-schema.md) and reports what changed. The exit code IS
-// the product here: a nightly job reads it, not the prose. See lib/map-diff.mjs for the matching
+// the product here: a nightly job reads it, not the prose. See lib/map-diff.ts for the matching
 // rule and for why disappearance, not appearance, is the failure signal.
 export async function diffCommand(
   options: Extract<ParsedOptions, { command: "diff" }>,
@@ -1848,6 +1861,7 @@ export async function exploreCommand(
       policy: options.policy,
       continues: options.continues,
       precondition: options.precondition,
+      expect: options.expect,
       identityLabel: options.identityLabel,
       acquireUntil:
         (options as { acquireUntil?: number | null }).acquireUntil ?? null,

@@ -1,6 +1,6 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { isAbsolute, resolve } from 'node:path';
-import { assertRunId } from './capture-metadata.mjs';
+import { assertRunId } from './capture-metadata.ts';
 
 export const PHASE_COSTS = {
   caller: 'unknown until caller ends',
